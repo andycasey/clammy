@@ -745,6 +745,23 @@ def fit_rv(
         "resolution_R": float(R_of_sigma_kms(sigma_kms_star)) if sigma_kms_star > 0 else np.inf,
     }
 
+    # --- EXACT chi2 curves vs the fitted broadening params (at the optimum) -----
+    # The coarse-scan surface uses the M_TT(0) (zero-shift) approximation, whose
+    # broadening (R/vsini) minimum is biased at large RV shifts. For an honest
+    # diagnostic we recompute chi2 EXACTLY along R and vsini at the refined optimum
+    # (fixing p, the other broadening, and the telluric lag) -- one FFT + solve each,
+    # so its minimum coincides with the reported value.
+    if fit_resolution:
+        R_grid_fine = np.geomspace(R_bounds[0], R_bounds[1], 40)
+        out["R_curve"] = (R_grid_fine, np.array([
+            _exact_at(p_star, float(sigpix_of_R(R)), vsp_star, p_tell_star)[0]
+            for R in R_grid_fine]))
+    if fit_vsini:
+        vs_grid_fine = np.linspace(vsini_bounds[0], vsini_bounds[1], 40)
+        out["vsini_curve"] = (vs_grid_fine, np.array([
+            _exact_at(p_star, sp_star, float(vk / velscale), p_tell_star)[0]
+            for vk in vs_grid_fine]))
+
     # --- build the (p, sigma_obs, vsini) -> (v, R, vsini) Jacobian + cov --------
     # column order of cov_x matches x_star = [p (, sigma_obs_pix) (, vsini_pix)].
     nl_labels = ["v"]

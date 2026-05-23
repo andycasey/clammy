@@ -530,48 +530,52 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
 
 
 def _plot_scan(res, path, source=None):
-    """Coarse-scan profiled chi2: chi2(v, R) when R was fit, else chi2(v)."""
+    """Profiled Delta-chi2 vs each fitted nonlinear parameter.
+
+    chi2(v) is the coarse FFT scan (its velocity minimum is exact); chi2(R) and
+    chi2(vsini) are recomputed EXACTLY at the optimum (``R_curve``/``vsini_curve``
+    from the fitter), so their minima coincide with the reported values -- unlike
+    the coarse (M_TT(0)-approximation) surface, whose R-minimum is biased at large
+    RV shifts.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # (x, Delta-chi2, x_opt, xlabel, ylabel, log-x?)
+    panels = []
     v = np.asarray(res["v_grid"], float)
-    if "chi2_2d" in res and "R_grid" in res:
-        chi2 = np.asarray(res["chi2_2d"], float)  # (n_sp, S); row 0 = no broadening
-        Rg = np.asarray(res["R_grid"], float)  # (n_sp-1,), aligned with rows 1:
-        dchi = chi2 - np.nanmin(chi2)
-        fig, ax = plt.subplots(
-            2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [1, 2]}
-        )
-        ax[0].plot(v, dchi.min(axis=0), lw=0.8, color="0.2")
-        ax[0].axvline(res["v_kms"], color="C3", lw=0.8)
-        ax[0].set_ylabel(r"$\Delta\chi^2$ (profiled over R)")
-        from matplotlib.colors import LogNorm
+    cv = np.asarray(res["chi2_grid"], float)
+    panels.append((v, cv - np.nanmin(cv), res["v_kms"], "v [km/s]",
+                   r"$\Delta\chi^2$ (coarse)", False))
+    if "R_curve" in res:
+        Rg, cR = res["R_curve"]
+        panels.append((np.asarray(Rg, float), np.asarray(cR, float) - np.nanmin(cR),
+                       res["resolution_R"], "R", r"$\Delta\chi^2$ (exact)", True))
+    if "vsini_curve" in res:
+        vg, cvs = res["vsini_curve"]
+        panels.append((np.asarray(vg, float), np.asarray(cvs, float) - np.nanmin(cvs),
+                       res["vsini_kms"], "vsini [km/s]", r"$\Delta\chi^2$ (exact)", False))
 
-        d2 = np.clip(dchi[1:], 1.0, None)  # color by log of Delta-chi2 (compress range)
-        pm = ax[1].pcolormesh(
-            v, Rg, d2, shading="auto", cmap="viridis",
-            norm=LogNorm(vmin=1.0, vmax=max(10.0, float(np.nanmax(d2)))),
-        )
-        ax[1].plot(res["v_kms"], res["resolution_R"], "x", color="tab:red", ms=10, mew=2)
-        ax[1].set_ylabel("R")
-        ax[1].set_xlabel("v [km/s]")
-        fig.colorbar(pm, ax=ax[1], label=r"$\Delta\chi^2$ (log scale)")
-        title = f"chi2(v, R) scan: v={res['v_kms']:.2f} km/s, R={res['resolution_R']:.0f}"
-    else:
-        dchi = np.asarray(res["chi2_grid"], float)
-        dchi = dchi - np.nanmin(dchi)
-        fig, axx = plt.subplots(figsize=(10, 4))
-        axx.plot(v, dchi, lw=0.8, color="0.2")
-        axx.axvline(res["v_kms"], color="C3", lw=0.8)
-        axx.set_xlabel("v [km/s]")
-        axx.set_ylabel(r"$\Delta\chi^2$")
-        ax = [axx]
-        title = f"chi2(v) scan: v={res['v_kms']:.2f} km/s"
-    ax[0].set_title((f"{source}\n" if source else "") + title)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 3.0 * len(panels)))
+    axes = np.atleast_1d(axes)
+    for ax, (x, d, xopt, xlabel, ylabel, logx) in zip(axes, panels):
+        ax.plot(x, d, lw=1.0, color="0.2")
+        ax.axvline(xopt, color="tab:red", lw=1.2, label=f"fit = {xopt:.4g}")
+        if logx:
+            ax.set_xscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper center", fontsize=8)
+    title = f"v={res['v_kms']:+.2f} km/s"
+    if "R_curve" in res:
+        title += f", R={res['resolution_R']:.0f}"
+    if "vsini_curve" in res:
+        title += f", vsini={res['vsini_kms']:.1f}"
+    axes[0].set_title((f"{source}\n" if source else "") + title)
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
+    fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
