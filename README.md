@@ -17,11 +17,11 @@ RV+weights and its convexity → continuum → convolution/R) is in
 
 Resample to a uniform log-wavelength grid $`x = \ln\lambda`$, so a radial
 velocity $`v`$ acts as a pure translation $`T_k(x) \to T_k(x - \Delta x)`$ with
-$`\Delta x = \ln(1 + v/c)`$. Working in log-flux makes the
+$`\Delta x = \ln(1 + v/c)`$. Working in log-flux $`Y \equiv \ln d`$ makes the
 (continuum $`\times`$ rectified-flux) model additive:
 
 ```math
-\ln d(x)  \approx  \underbrace{\sum_{k=0}^{K} w_k T_k(x - \Delta x)}_{\text{rectified line basis}}  +  \underbrace{\sum_{m=0}^{L} c_m P_m(x)}_{\text{log-continuum}}
+Y(x)  \approx  \underbrace{\sum_{k=0}^{K} w_k T_k(x - \Delta x)}_{\text{rectified line basis}}  +  \underbrace{\sum_{m=0}^{L} c_m P_m(x)}_{\text{log-continuum}}
 ```
 
 The templates $`\mathbf{T} = [\mu, \phi_1, \dots, \phi_K]`$ are the basis of the
@@ -29,21 +29,21 @@ The templates $`\mathbf{T} = [\mu, \phi_1, \dots, \phi_K]`$ are the basis of the
 $`\phi_k \equiv T_k`$); $`P_m`$ are Legendre polynomials. At fixed $`\Delta x`$ the model
 is linear in $`\boldsymbol\theta = (\mathbf{w}, \mathbf{c})`$, so we solve linearly
 inside, scan $`\Delta x`$ outside. With the design
-$`\mathbf{A}(\Delta x) = [ \mathbf{T}(\Delta x) \mid \mathbf{P} ]`$ and weights
-$`\mathbf{W} = \mathrm{diag}(W_i)`$ on $`\ln d`$ ($`W_i = (d_i/\sigma_i)^2`$;
-masked px $`\to W_i = 0`$):
+$`\mathbf{A}(\Delta x) = [ \mathbf{T}(\Delta x) \mid \mathbf{P} ]`$ and the data
+covariance $`\mathbf{C} = \mathrm{diag}(\sigma_{Y,i}^2)`$ of $`Y`$ ($`\sigma_{Y,i} \approx \sigma_i/d_i`$;
+masked px $`\to (\mathbf{C}^{-1})_{ii} = 0`$):
 
 ```math
-\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix} \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W} \ln d
+\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{C}^{-1}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix} \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{C}^{-1}\mathbf{Y}
 ```
 
 ```math
-\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r} \qquad \chi^2(\Delta x) = \|\ln d\|^2_{\mathbf{W}} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}
+\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r} \qquad \chi^2(\Delta x) = \mathbf{Y}^{\mathsf{T}}\mathbf{C}^{-1}\mathbf{Y} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}
 ```
 
-This $`\mathbf{W}`$ is the inverse-variance weight of $`\ln d`$
-($`\sigma_{\ln d} \approx \sigma_d/d`$; masked px get weight $`0`$), playing the role
-of $`\Sigma^{-1}`$. The radial-velocity estimate is the global minimiser
+Here $`\mathbf{C}`$ is the diagonal data covariance of $`Y`$
+($`\sigma_Y \approx \sigma_d/d`$; masked px get zero weight, $`(\mathbf{C}^{-1})_{ii} = 0`$),
+so $`\mathbf{C}^{-1}`$ is the inverse-variance weight. The radial-velocity estimate is the global minimiser
 $`\widehat{\Delta x} = \arg\min_{\Delta x} \chi^2(\Delta x)`$, with
 $`\widehat v = c (e^{\widehat{\Delta x}} - 1)`$.
 
@@ -76,7 +76,7 @@ The same separable structure absorbs three further nuisances. The full log-flux
 forward model is
 
 ```math
-\ln d(x) \approx \underbrace{G_{\rm rot}(v\sin i) G_{\rm inst}}_{\text{stellar}} \sum_{k=0}^{K} w_k T_k(x - \Delta x)  +  \underbrace{G_{\rm inst}}_{\text{telluric}} \sum_{j=0}^{J} u_j S_j(x)  +  \sum_{m=0}^{L} c_m P_m(x)
+Y(x) \approx \underbrace{G_{\rm rot}(v\sin i) G_{\rm inst}}_{\text{stellar}} \sum_{k=0}^{K} w_k T_k(x - \Delta x)  +  \underbrace{G_{\rm inst}}_{\text{telluric}} \sum_{j=0}^{J} u_j S_j(x)  +  \sum_{m=0}^{L} c_m P_m(x)
 ```
 
 with $`G_{\rm inst}`$ the instrument LSF and $`G_{\rm rot}(v\sin i)`$ the rotation

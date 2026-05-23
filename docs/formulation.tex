@@ -1,0 +1,611 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage[round,authoryear]{natbib}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!50!black,
+}
+
+% --- consistent macros ------------------------------------------------------
+\newcommand{\T}{\mathsf{T}}                    % transpose
+\newcommand{\dx}{\Delta x}                     % log-wavelength shift
+\newcommand{\half}{\tfrac{1}{2}}
+\newcommand{\rfft}{\mathrm{rfft}}
+\newcommand{\irfft}{\mathrm{irfft}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\velscale}{\mathrm{velscale}}
+
+\title{A Separable Framework for Joint Radial Velocity,\\
+Template Weight, Continuum, and Spectral Resolution\\
+Fitting of Stellar Spectra}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We derive the spectral-fitting framework implemented in this project, which
+simultaneously recovers a radial velocity $v$, the weights $\mathbf{w}$ of a
+learned (PCA) template basis, a smooth Legendre continuum $\mathbf{c}$, and
+optionally the instrumental spectral resolution $R$, from a single observed
+stellar spectrum. The key structural fact, exploited throughout, is
+\emph{separability}: working in log-wavelength $x=\ln\lambda$ and in log-flux,
+the radial velocity becomes a uniform translation, the resolution becomes a
+fixed-width Gaussian, and the continuum becomes additive, so that at fixed values
+of the nonlinear parameters $(v,R)$ the model is \emph{linear} in
+$\boldsymbol\theta=(\mathbf{w},\mathbf{c})$ and admits an exact weighted
+least-squares solution. We build the model in seven steps: the linear template
+fit; the radial-velocity translation and per-shift solve (the cross-correlation
+of \citealt*{TonryDavis1979}, generalised to a template basis); FFT acceleration
+of the entire velocity scan; the convexity structure of the joint problem
+(convex in the linear block, multimodal in $v$); the additive Legendre continuum
+(in the spirit of the multiplicative/additive polynomials of pPXF,
+\citealt*{Cappellari2017}); the on-the-fly Gaussian broadening for resolution,
+together with an honest accounting of the log-space convolution approximation;
+and finally the actual optimiser --- a coarse Fourier scan to locate the global
+basin followed by a JAX-autodiff damped-Newton refinement of the profiled
+$\chi^2$, with covariances from its Hessian. The PCA-template basis and the
+external resolution/redshift scan parallel the classification approach of
+\citet*{Bolton2012}.
+\end{abstract}
+
+% ============================================================================
+\section*{Notation}
+% ============================================================================
+All symbols used in this document are collected in Table~\ref{tab:notation} and
+are not redefined elsewhere. Vectors are bold lowercase (the log-flux data $\mathbf{Y}$ is the lone
+bold-uppercase vector), matrices bold uppercase; the per-pixel index is $i=1,\dots,n$; a hat denotes an estimate.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{0.55\textwidth}@{}}
+\toprule
+Symbol & Type & Meaning \\
+\midrule
+$\lambda$            & --        & wavelength \\
+$c$                  & scalar    & speed of light \\
+$x=\ln\lambda$       & --        & log-wavelength coordinate \\
+$x_i$                & pixels    & uniform log-wavelength grid, $i=1,\dots,n$ \\
+$\delta$             & scalar    & constant pixel spacing in $x$, $\;\delta=x_{i+1}-x_i$ \\
+$n$                  & scalar    & number of pixels \\[2pt]
+$v$                  & scalar    & radial velocity \\
+$\dx=\ln(1+v/c)$     & scalar    & log-wavelength shift induced by $v$ \\
+$p=\dx/\delta$       & pixels    & translation in pixels (the ``lag'') \\[2pt]
+$d_i$                & vector    & observed (linear) flux in pixel $i$ \\
+$\sigma_i$           & vector    & $1\sigma$ noise on $d_i$ \\
+$Y_i=\ln d_i$        & vector    & log-flux (the modelled quantity) \\
+$C_i=(\sigma_i/d_i)^2$ & vector  & variance of $Y_i$; weight $C_i^{-1}=0$ if masked \\
+$\mathbf{C}=\diag(C_i)$ & matrix & diagonal data covariance of $\mathbf{Y}$; weight $\mathbf{C}^{-1}$ \\[2pt]
+$T_0=\mu$            & vector    & mean rectified log-flux template \\
+$T_k=\phi_k$         & vector    & $k$-th rectified-log-flux PCA component, $k=1,\dots,K$ \\
+$\mathbf{T}$         & $n\times(K{+}1)$ & template design block, columns $[\mu,\phi_1,\dots,\phi_K]$ \\
+$K$                  & scalar    & number of PCA components \\
+$\mathbf{w}=(w_0,\dots,w_K)$ & vector & template weights ($w_0$ multiplies $\mu$) \\[2pt]
+$P_m$                & vector    & $m$-th Legendre continuum column, $m=0,\dots,L$ \\
+$\mathbf{P}$         & $n\times(L{+}1)$ & continuum design block \\
+$L$                  & scalar    & continuum (Legendre) order \\
+$\mathbf{c}=(c_0,\dots,c_L)$ & vector & continuum coefficients \\[2pt]
+$\mathbf{A}$         & $n\times D$ & full design matrix $[\,\mathbf{T}\mid\mathbf{P}\,]$, $D=(K{+}1)+(L{+}1)$ \\
+$\boldsymbol\theta=(\mathbf{w},\mathbf{c})$ & vector & full linear parameter vector \\
+$\mathbf{N}=\mathbf{A}^\T\mathbf{C}^{-1}\mathbf{A}$ & matrix & normal matrix \\
+$\mathbf{r}=\mathbf{A}^\T\mathbf{C}^{-1}\mathbf{Y}$ & vector & right-hand side \\
+$\mathbf{M}_{TT},\mathbf{M}_{TP},\mathbf{M}_{PP}$ & matrix & blocks of $\mathbf{N}$ \\
+$\mathbf{b}_T,\mathbf{b}_P$ & vector & blocks of $\mathbf{r}$ \\[2pt]
+$R=\lambda/\Delta\lambda$ & scalar & spectral resolving power \\
+$\sigma_v$           & scalar    & LSF velocity dispersion \\
+$\sigma_{\rm pix}$   & scalar    & LSF width in pixels on the log grid \\
+$\velscale=c\,\delta$ & scalar   & velocity per pixel \\
+$f=2\sqrt{2\ln 2}$   & scalar    & FWHM-to-$\sigma$ conversion factor \\[2pt]
+$\omega$             & vector    & Fourier frequency (cycles per pixel) \\
+$\rfft,\irfft$       & --        & real forward / inverse FFT \\
+$\chi^2$             & scalar    & weighted least-squares objective \\
+$\widehat{(\cdot)}$  & --        & estimate of a quantity \\
+\bottomrule
+\end{tabular}
+\caption{Strict notation used throughout. Symbols are defined once here.}
+\label{tab:notation}
+\end{table}
+
+% ============================================================================
+\section{Setup and the linear template fit}
+\label{sec:setup}
+% ============================================================================
+We begin by resampling both the observed spectrum and the templates onto a single
+uniform grid in log-wavelength, $x_i = x_1 + (i-1)\delta$ with $i=1,\dots,n$ and
+constant spacing $\delta$. Two facts motivate this grid: a Doppler shift is a
+uniform translation in $x$ (Section~\ref{sec:rv}), and at constant resolving
+power the line-spread function (LSF) has a constant width in $x$
+(Section~\ref{sec:resolution}).
+
+We model the spectrum in \emph{log-flux}, $Y_i=\ln d_i$. This is the natural space
+for two reasons. First, the observed flux is the product of a smooth continuum and
+a normalised (rectified) spectrum, and the logarithm turns this product into a
+sum, making the continuum an \emph{additive} term (Section~\ref{sec:continuum}).
+Second, the template basis is built in log-rectified flux, as follows. Each model
+spectrum is converted to log-flux, a robust low-order Legendre fit to the upper
+(continuum) envelope is subtracted to \emph{rectify} it, and a PCA is performed on
+the rectified spectra. This yields a mean rectified log-flux spectrum $\mu(x)$ and
+orthonormal principal components $\phi_k(x)$, $k=1,\dots,K$, that capture the
+\emph{line} information. We collect them as the columns of the template block,
+\begin{equation}
+  \mathbf{T} = \big[\,\mu \;\big|\; \phi_1 \;\big|\; \cdots \;\big|\; \phi_K\,\big],
+  \qquad T_0\equiv\mu,\quad T_k\equiv\phi_k,
+\end{equation}
+so that $\mathbf{T}$ has $K+1$ columns. The mean $\mu$ is treated as a
+free-weight template (column $T_0$, weight $w_0$), so it is Doppler-shifted like
+any component.
+
+The simplest fitting problem models the observed log-rectified flux as a linear
+combination of the templates,
+\begin{equation}
+  Y(x) \;=\; \sum_{k=0}^{K} w_k\, T_k(x),
+  \label{eq:linmodel}
+\end{equation}
+with weight vector $\mathbf{w}=(w_0,\dots,w_K)$.
+
+\paragraph{Data covariance.}
+The noise is naturally specified on the linear flux $d_i$ with dispersion
+$\sigma_i$. Propagating to log-flux via $Y_i=\ln d_i$ and the first-order
+(delta-method) linearisation gives the variance of $Y_i$,
+\begin{equation}
+  \sigma_{Y,i}\;\approx\;\left|\frac{\partial \ln d}{\partial d}\right|\sigma_i
+  \;=\;\frac{\sigma_i}{d_i},
+  \qquad\Longrightarrow\qquad
+  C_i \;=\; \sigma_{Y,i}^2 \;=\; \left(\frac{\sigma_i}{d_i}\right)^2 ,
+  \label{eq:weights}
+\end{equation}
+so the inverse-variance weight is $C_i^{-1}=(d_i/\sigma_i)^2$. Bad or out-of-range
+pixels (non-finite $d_i$ or $\sigma_i$, $d_i\le 0$, masked pixels) are excised by
+setting $C_i^{-1}=0$ (equivalently $C_i\to\infty$); we write $\mathbf{C}=\diag(C_i)$
+and let $n_{\rm good}=\#\{i:C_i^{-1}>0\}$ be the number of usable pixels.
+
+\paragraph{Weighted least squares.}
+With the design matrix taken to be the template block $\mathbf{T}$, the objective
+is the weighted residual sum of squares,
+\begin{equation}
+  \chi^2(\mathbf{w}) \;=\; (\mathbf{Y}-\mathbf{T}\mathbf{w})^\T \mathbf{C}^{-1}\,(\mathbf{Y}-\mathbf{T}\mathbf{w}).
+  \label{eq:chi2lin}
+\end{equation}
+This is a quadratic in $\mathbf{w}$; setting $\nabla_{\mathbf w}\chi^2=0$ yields
+the normal equations
+\begin{equation}
+  \mathbf{N}\,\mathbf{w} \;=\; \mathbf{r},
+  \qquad
+  \mathbf{N} \;=\; \mathbf{T}^\T\mathbf{C}^{-1}\mathbf{T},
+  \qquad
+  \mathbf{r} \;=\; \mathbf{T}^\T\mathbf{C}^{-1}\mathbf{Y},
+  \label{eq:normaleq}
+\end{equation}
+with the unique solution and minimum value
+\begin{equation}
+  \widehat{\mathbf{w}} \;=\; \mathbf{N}^{-1}\mathbf{r},
+  \qquad
+  \chi^2(\widehat{\mathbf{w}}) \;=\; \mathbf{Y}^\T\mathbf{C}^{-1}\mathbf{Y}
+  \;-\; \mathbf{r}^\T \mathbf{N}^{-1}\mathbf{r}.
+  \label{eq:chi2profiled}
+\end{equation}
+The Hessian of \eqref{eq:chi2lin} is $2\mathbf{N}=2\,\mathbf{T}^\T\mathbf{C}^{-1}\mathbf{T}\succeq 0$,
+so the problem is a convex quadratic; it is \emph{strictly} convex --- with a
+unique minimiser --- if and only if $\mathbf{T}^\T\mathbf{C}^{-1}\mathbf{T}$ is
+positive definite, which requires the weighted template columns to be linearly
+independent. If they are not (a (near-)singular $\mathbf{N}$, e.g.\ from
+collinear components or too few good pixels), the solve is regularised: a Tikhonov
+ridge $\mathbf{N}\!\to\!\mathbf{N}+\rho\mathbf{I}$, a truncated SVD, or a
+non-negativity constraint (NNLS) when physical positivity of the weights is
+desired.
+
+% ============================================================================
+\section{Radial velocity as translation: the per-shift linear solve}
+\label{sec:rv}
+% ============================================================================
+A radial velocity $v$ Doppler-shifts every wavelength by the factor $1+v/c$
+(non-relativistically). In log-wavelength this is a \emph{uniform translation},
+\begin{equation}
+  \lambda \to \lambda\,(1+v/c)
+  \quad\Longleftrightarrow\quad
+  x \to x + \dx,\qquad \dx \equiv \ln\!\Big(1+\frac{v}{c}\Big),
+\end{equation}
+which on the pixel grid is a shift of $p=\dx/\delta$ pixels. The model templates
+therefore become $T_k(x)\to T_k(x-\dx)$, i.e.\ each column of $\mathbf{T}$ is
+translated by $p$ pixels. We write the shifted design as $\mathbf{T}(p)$, with
+columns $[T_k(x_i - p\,\delta)]_i$.
+
+The forward model \eqref{eq:linmodel} now reads
+$Y(x)=\sum_k w_k\,T_k(x-\dx)$. Crucially, it is \emph{linear in $\mathbf{w}$ only
+at a fixed shift $p$}; the dependence on $p$ is nonlinear. This structure is
+\emph{separable}: we scan the single nonlinear parameter $p$ on the
+\emph{outside} and solve the linear weight problem exactly on the \emph{inside}.
+For each trial shift,
+\begin{equation}
+  \mathbf{N}(p) = \mathbf{T}(p)^\T\mathbf{C}^{-1}\,\mathbf{T}(p),
+  \qquad
+  \mathbf{r}(p) = \mathbf{T}(p)^\T\mathbf{C}^{-1}\,\mathbf{Y},
+  \qquad
+  \widehat{\mathbf{w}}(p)=\mathbf{N}(p)^{-1}\mathbf{r}(p),
+  \label{eq:shiftsolve}
+\end{equation}
+and the \emph{profiled} objective, obtained by minimising out $\mathbf{w}$ as in
+\eqref{eq:chi2profiled}, is
+\begin{equation}
+  \chi^2(p)\;=\;\min_{\mathbf{w}}\chi^2(\mathbf{w},p)
+  \;=\;\mathbf{Y}^\T\mathbf{C}^{-1}\mathbf{Y}-\mathbf{r}(p)^\T\mathbf{N}(p)^{-1}\mathbf{r}(p).
+  \label{eq:profiledp}
+\end{equation}
+The radial-velocity estimate is the global minimiser,
+\begin{equation}
+  \widehat{p}\;=\;\argmin_{p}\,\chi^2(p),
+  \qquad
+  \widehat{v}\;=\;c\,\big(e^{\widehat{p}\,\delta}-1\big).
+\end{equation}
+For a single template ($K=0$, no continuum, uniform weights) the cross term
+$\mathbf{r}(p)^\T\mathbf{N}(p)^{-1}\mathbf{r}(p)$ reduces to the squared
+template--data cross-correlation, so maximising it over $p$ is exactly the
+classical cross-correlation velocity measurement of \citet*{TonryDavis1979}.
+Equation~\eqref{eq:profiledp} is its generalisation to a multi-column template
+\emph{basis} (and, in Sections~\ref{sec:continuum}--\ref{sec:resolution}, to a
+joint continuum and resolution model).
+
+% ============================================================================
+\section{FFT acceleration of the velocity scan}
+\label{sec:fft}
+% ============================================================================
+A direct evaluation of \eqref{eq:profiledp} on a grid of $n_{\rm shifts}$ trial
+velocities, each requiring $\mathbf{T}(p)^\T\mathbf{C}^{-1}\mathbf{T}(p)$ and
+$\mathbf{T}(p)^\T\mathbf{C}^{-1}\mathbf{Y}$, costs
+$O(n_{\rm shifts}\,n\,K^2)$. The expensive shift-dependent pieces are, however,
+all \emph{cross-correlations of fixed vectors against a shifted template}, which a
+single FFT per template column delivers at \emph{all} shifts simultaneously.
+
+Consider the right-hand side. Its $k$-th template entry, as a function of the
+integer lag $p$, is
+\begin{equation}
+  b_{T,k}(p) \;=\; \sum_{i} T_k(x_i - p\,\delta)\,C_i^{-1}\,Y_i
+  \;=\; \big[\,T_k \star (\mathbf{C}^{-1}\mathbf{Y})\,\big](p),
+  \label{eq:bTcorr}
+\end{equation}
+a discrete cross-correlation of the fixed weighted-data vector $\mathbf{C}^{-1}\mathbf{Y}$
+against $T_k$. By the cross-correlation theorem, for any two real vectors
+$t,s$ of length $n$,
+\begin{equation}
+  \operatorname{corr}(t,s)\;=\;\irfft\!\big(\,\overline{\rfft(t)}\,\cdot\,\rfft(s)\,\big),
+  \label{eq:corrthm}
+\end{equation}
+where $\rfft$/$\irfft$ are the real forward/inverse FFTs, the product is
+elementwise over frequencies $\omega$, and the overline denotes complex
+conjugation. Hence
+\begin{equation}
+  \mathbf{b}_T(\cdot)\;=\;\irfft\!\Big(\,\overline{\rfft(\mathbf{T})}\,\cdot\,\rfft(\mathbf{C}^{-1}\mathbf{Y})\Big),
+  \label{eq:bTfft}
+\end{equation}
+computed once for every lag and every template column. A fractional (sub-pixel)
+shift is applied in the same domain as a linear phase ramp,
+\begin{equation}
+  \rfft\!\big[T_k(\cdot - p\,\delta)\big]
+  \;=\; \rfft(T_k)\,\cdot\,e^{-2\pi i\,\omega\,p},
+  \label{eq:phaseramp}
+\end{equation}
+so the model template at any real-valued $p$ is recovered by
+$\irfft\!\big(\rfft(T_k)\,e^{-2\pi i\omega p}\big)$.
+
+The normal-matrix block $\mathbf{M}_{TT}(p)=\mathbf{T}(p)^\T\mathbf{C}^{-1}\mathbf{T}(p)$
+depends on $p$ \emph{only} through the (slowly varying) weights $\mathbf{C}^{-1}$: if
+$\mathbf{C}^{-1}$ were constant, $\mathbf{M}_{TT}$ would be exactly shift-invariant.
+We therefore approximate $\mathbf{M}_{TT}(p)\approx\mathbf{M}_{TT}(0)$ during the
+scan (cheap, evaluated once) and recompute $\mathbf{M}_{TT}$ \emph{exactly} at the
+refined optimum (Section~\ref{sec:opt}).
+
+\paragraph{Circular-edge handling.}
+The FFT correlation in \eqref{eq:corrthm} is \emph{circular}: content shifted off
+one end wraps to the other. To make the circular correlation equal the desired
+linear one over the region of interest, we zero the data weights $C_i^{-1}$ in a band
+of width equal to the maximum lag $|p|_{\max}$ at \emph{both} ends of the grid.
+Within the interior valid region, no wrapped pixel ever carries weight for any
+evaluated shift, so the circular and linear correlations coincide.
+
+\paragraph{Cost.}
+The whole velocity scan now costs $O\!\big(K\,n\log n\big)$ --- a handful of FFTs
+of length $n$, one per template column --- instead of
+$O(n_{\rm shifts}\,n\,K^2)$, a decisive saving when $n_{\rm shifts}$ and $n$ are
+both large.
+
+% ============================================================================
+\section{Joint RV and weights: the convexity structure}
+\label{sec:convexity}
+% ============================================================================
+A natural question is whether the joint problem in $(\mathbf{w},p)$ is convex. The
+answer is block-structured, and worth stating precisely because it dictates the
+optimisation strategy.
+
+\paragraph{Convex in the linear block.}
+At any fixed shift $p$, the objective $\chi^2(\mathbf{w},p)$ in \eqref{eq:chi2lin}
+(with $\mathbf{T}\!\to\!\mathbf{T}(p)$) is a convex quadratic in $\mathbf{w}$ with
+Hessian $2\mathbf{N}(p)\succeq 0$; it is globally and (when $\mathbf{N}(p)\succ0$)
+uniquely solvable in closed form by \eqref{eq:shiftsolve}. There are no spurious
+local minima in the weights.
+
+\paragraph{Non-convex in the nonlinear parameter.}
+The profiled objective $\chi^2(p)$ of \eqref{eq:profiledp}, obtained by
+minimising out $\mathbf{w}$, is \emph{not} convex in $p$. Up to the constant
+$\mathbf{Y}^\T\mathbf{C}^{-1}\mathbf{Y}$, it is the (negated) generalised
+cross-correlation surface $\mathbf{r}(p)^\T\mathbf{N}(p)^{-1}\mathbf{r}(p)$, which
+is inherently \emph{multimodal}: the quasi-periodic absorption-line pattern and
+the self-similarity of the templates produce sidelobes (secondary minima) at lags
+offset from the truth by characteristic line spacings, with one dominant minimum
+at the true velocity.
+
+\paragraph{Consequence.}
+The joint problem is thus \emph{convex in the linear block,
+non-convex (multimodal) in the nonlinear parameter}. Globally it is not convex;
+block-wise (in $\mathbf{w}$) and locally (near the dominant peak) it is. This is
+exactly why the method uses a \emph{global coarse scan} over $p$ to identify the
+basin of the dominant minimum (Section~\ref{sec:fft}), followed by a
+\emph{local refinement} (Section~\ref{sec:opt}) in which the main peak is smooth
+and approximately parabolic, hence locally well-behaved (locally convex). The
+short answer to ``is it convex?'' is: \emph{no globally, yes block-wise and
+locally}.
+
+% ============================================================================
+\section{Adding the continuum within the same linear model}
+\label{sec:continuum}
+% ============================================================================
+The observed spectrum is the product of a smooth continuum and the rectified
+(line) spectrum. In log-flux this product becomes a sum, so a smooth continuum is
+an \emph{additive} term that we represent with low-order Legendre polynomials
+$P_m$, $m=0,\dots,L$, evaluated on $x$ mapped affinely onto $[-1,1]$ across the
+fit range,
+\begin{equation}
+  \tilde{x}_i \;=\; 2\,\frac{x_i - x_1}{x_n - x_1} - 1 \;\in\; [-1,1],
+  \qquad
+  (\mathbf{P})_{im}\;=\;P_m(\tilde{x}_i).
+\end{equation}
+The full forward model in log-flux is then
+\begin{equation}
+  Y(x) \;=\; \underbrace{\sum_{k=0}^{K} w_k\,T_k(x-\dx)}_{\text{rectified line basis}}
+  \;+\; \underbrace{\sum_{m=0}^{L} c_m\,P_m(x)}_{\text{log-continuum}} .
+  \label{eq:fullmodel}
+\end{equation}
+We augment the design matrix by appending the continuum block,
+\begin{equation}
+  \mathbf{A}(p) \;=\; \big[\,\mathbf{T}(p)\;\big|\;\mathbf{P}\,\big],
+  \qquad
+  \boldsymbol\theta \;=\; (\mathbf{w},\mathbf{c}),
+\end{equation}
+with $\mathbf{A}$ of size $n\times D$, $D=(K{+}1)+(L{+}1)$. The continuum block is
+\emph{shift-independent}, so its contributions to the normal equations are
+precomputed once,
+\begin{equation}
+  \mathbf{M}_{PP} = \mathbf{P}^\T\mathbf{C}^{-1}\mathbf{P},
+  \qquad
+  \mathbf{b}_P = \mathbf{P}^\T\mathbf{C}^{-1}\mathbf{Y}
+  \qquad(\text{independent of }p).
+\end{equation}
+Only the template auto-block and the template--continuum cross-block depend on
+$p$:
+\begin{equation}
+  \mathbf{M}_{TT}(p) = \mathbf{T}(p)^\T\mathbf{C}^{-1}\mathbf{T}(p),
+  \qquad
+  \mathbf{M}_{TP}(p) = \mathbf{T}(p)^\T\mathbf{C}^{-1}\mathbf{P},
+\end{equation}
+and the cross-block $\mathbf{M}_{TP}(p)$ is, like \eqref{eq:bTcorr}, a
+cross-correlation of the fixed weighted-continuum columns
+$\mathbf{C}^{-1}\mathbf{P}$ against the shifted templates --- so it too is obtained at
+all lags by FFT, $\mathbf{M}_{TP}(\cdot)=\irfft\big(\overline{\rfft(\mathbf{T})}\cdot\rfft(\mathbf{C}^{-1}\mathbf{P})\big)$.
+The block normal equations are
+\begin{equation}
+  \mathbf{N}(p) =
+  \begin{bmatrix}
+    \mathbf{M}_{TT}(p) & \mathbf{M}_{TP}(p)\\[2pt]
+    \mathbf{M}_{TP}(p)^\T & \mathbf{M}_{PP}
+  \end{bmatrix},
+  \qquad
+  \mathbf{r}(p) =
+  \begin{bmatrix}
+    \mathbf{b}_T(p)\\[2pt]
+    \mathbf{b}_P
+  \end{bmatrix},
+  \label{eq:blockN}
+\end{equation}
+with the inner solve and profiled objective exactly as before,
+\begin{equation}
+  \widehat{\boldsymbol\theta}(p) = \mathbf{N}(p)^{-1}\mathbf{r}(p),
+  \qquad
+  \chi^2(p) = \mathbf{Y}^\T\mathbf{C}^{-1}\mathbf{Y} - \mathbf{r}(p)^\T\mathbf{N}(p)^{-1}\mathbf{r}(p).
+  \label{eq:profiledp2}
+\end{equation}
+
+\paragraph{Why separate the continuum from the templates.}
+Because the templates are \emph{rectified} (their pseudo-continuum has been
+removed before the PCA), they carry essentially only line information and are
+approximately zero in the continuum. The smooth flux level is carried entirely by
+the orthogonal Legendre block. This separation of roles is what avoids the
+classic \emph{template/continuum degeneracy}: were the templates allowed to carry
+broadband shape, a low-order continuum could partially mimic and absorb it,
+leaving $\mathbf{N}$ ill-conditioned and $(\mathbf{w},\mathbf{c})$ poorly
+determined. Rectifying the templates and modelling the continuum as a separate,
+smooth, additive block keeps the two contributions linearly independent (to the
+extent that line structure and low-order polynomials are dissimilar) and the solve
+well-conditioned. This is the same design principle as the additive and
+multiplicative polynomial continua in pPXF \citep*{Cappellari2017} and the
+PCA-template plus polynomial model of \citet*{Bolton2012}, here cast entirely in
+log-flux so that the multiplicative continuum becomes additive.
+
+% ============================================================================
+\section{Adding the spectral resolution}
+\label{sec:resolution}
+% ============================================================================
+A finite, lower instrumental resolution convolves the spectrum with a
+line-spread function, which we take to be Gaussian. At constant resolving power
+$R=\lambda/\Delta\lambda$, the LSF has a constant width \emph{in velocity},
+$\mathrm{FWHM}_v = c/R$, hence a constant velocity dispersion
+\begin{equation}
+  \sigma_v \;=\; \frac{c}{f\,R},
+  \qquad f \equiv 2\sqrt{2\ln 2}.
+\end{equation}
+On the log-wavelength grid, which is uniform in velocity with
+$\velscale = c\,\delta$ km\,s$^{-1}$ per pixel, this is a constant width in
+\emph{pixels},
+\begin{equation}
+  \sigma_{\rm pix} \;=\; \frac{\sigma_v}{\velscale} \;=\; \frac{c}{f\,R\,\velscale}.
+  \label{eq:sigpix}
+\end{equation}
+A convolution by a Gaussian of fixed pixel width is a single multiply in the
+Fourier domain: a Gaussian of standard deviation $\sigma_{\rm pix}$ has transform
+$\exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)$, so we broaden each template ``on the
+fly'' by
+\begin{equation}
+  \widehat{T}_k(\omega) \;\longrightarrow\; \widehat{T}_k(\omega)\,
+  \exp\!\big(-2\pi^2\,\omega^2\,\sigma_{\rm pix}^2\big).
+  \label{eq:fftgauss}
+\end{equation}
+The Fourier shift \eqref{eq:phaseramp} and the Fourier Gaussian
+\eqref{eq:fftgauss} compose trivially as a single elementwise product in the
+frequency domain,
+\begin{equation}
+  \widehat{T}_k(\omega)\;\longrightarrow\;
+  \widehat{T}_k(\omega)\,
+  \exp\!\big(-2\pi^2\omega^2\sigma_{\rm pix}^2\big)\,
+  e^{-2\pi i\omega p},
+\end{equation}
+so the broadened, shifted template at any real $(p,\sigma_{\rm pix})$ costs one
+inverse FFT. In particular the $\mathbf{b}_T$ and $\mathbf{M}_{TP}$
+cross-correlations at fixed $R$ are still FFTs --- broaden the template transform,
+then correlate.
+
+We promote $R$ (equivalently $\sigma_{\rm pix}$) to a \emph{second nonlinear,
+outer} parameter alongside $p$. The structure is unchanged: at fixed
+$(p,R)$ the model \eqref{eq:fullmodel} is still linear in
+$\boldsymbol\theta=(\mathbf{w},\mathbf{c})$, so the same separable scheme applies
+--- a $2$-D outer search/optimisation over $(p,R)$ wrapping the inner linear solve
+\eqref{eq:profiledp2}.
+
+\paragraph{An honest caveat: convolution and the logarithm do not commute.}
+The LSF physically convolves the \emph{linear} flux. But the inner solve is linear
+in $\boldsymbol\theta$ only if we broaden the \emph{log-rectified} templates,
+which keeps the additive log-continuum intact. These are not the same operation,
+because convolution does not commute with the logarithm. Writing the rectified
+log-flux as $M(x)$ and the LSF as a normalised kernel, a cumulant (second-order)
+expansion of the exact linear-flux broadening gives
+\begin{equation}
+  \ln\!\big(\mathrm{LSF}\!*\!e^{M}\big)
+  \;\approx\; \mathrm{LSF}\!*\!M \;+\; \half\,\Var_{\mathrm{LSF}}(M)
+  \;+\;\cdots,
+  \label{eq:cumulant}
+\end{equation}
+where $\Var_{\mathrm{LSF}}(M)$ is the local variance of $M$ under the kernel. The
+leading term $\mathrm{LSF}\!*\!M$ is precisely our log-space broadening
+\eqref{eq:fftgauss}; the $\tfrac12\Var$ term is the first correction, which is
+positive and largest where $M$ varies sharply --- i.e.\ in deep, saturated line
+cores --- so log-space broadening slightly \emph{over-deepens} those cores at
+second order. The continuum, being smooth on the scale of the LSF, has negligible
+variance under the kernel and so factors out, $\mathrm{LSF}\!*\!(\text{smooth})
+\approx\text{smooth}$, and remains additive --- exactly the property we need for
+linearity. We therefore conclude that the log-space convolution is a
+\emph{first-order-accurate} approximation: excellent for shallow and moderate
+lines, with a small, bounded core bias for the deepest lines. The exact
+linear-flux convolution, by contrast, would mix the components nonlinearly
+(broadening $\sum_k w_k T_k$ in linear flux is not $\sum_k w_k$ times broadened
+$T_k$ unless one broadens a \emph{single} fixed spectrum), breaking the linearity
+of the inner solve for a multi-component basis.
+
+\paragraph{Beyond a single Gaussian.}
+For a wavelength-dependent $R(\lambda)$ or a non-Gaussian LSF there is no
+closed-form Fourier multiply. The practical remedy is to precompute banded
+(sparse) convolution matrices on a grid of $R$ values and interpolate among them
+at fit time, retaining the linear inner solve at the cost of the single-multiply
+FFT shortcut.
+
+% ============================================================================
+\section{Optimisation and uncertainties}
+\label{sec:opt}
+% ============================================================================
+The fit proceeds in two stages, matched to the convexity structure of
+Section~\ref{sec:convexity}.
+
+\paragraph{(1) Global coarse scan.}
+The FFT machinery of Section~\ref{sec:fft} evaluates the profiled objective
+\eqref{eq:profiledp2} on a dense grid of integer lags $p$ across the velocity
+search window (and, when resolution is fit, on a coarse grid of $R$ values via the
+broadening \eqref{eq:fftgauss}, using the cheap approximation
+$\mathbf{M}_{TT}(p)\approx\mathbf{M}_{TT}(0)$). The minimum over this $1$-D (or
+$2$-D) surface locates the basin of the dominant peak, immune to the sidelobes.
+
+\paragraph{(2) Local refinement by autodiff Newton.}
+Starting from the coarse minimiser, the profiled $\chi^2$ as a function of the
+nonlinear parameters --- $p$, or $(p,\sigma_{\rm pix})$ when $R$ is fit --- is
+minimised locally. Because the radial-velocity translation \eqref{eq:phaseramp},
+the Gaussian broadening \eqref{eq:fftgauss}, and the inner linear solve
+\eqref{eq:profiledp2} are all differentiable operations, the gradient and Hessian
+of the profiled $\chi^2$ are obtained \emph{exactly} by JAX automatic
+differentiation. The refinement is a damped (Levenberg--Marquardt) Newton
+iteration: at each step the symmetrised Hessian is floored to positive definite by
+LM damping, the resulting step is forced to be a descent direction, and its length
+is set by a backtracking line search enforcing the Armijo sufficient-decrease
+condition. On the smooth, low-dimensional, locally near-parabolic main peak this
+converges in a few iterations.
+
+\paragraph{Exact final solve.}
+At the refined optimum $(\widehat p,\widehat\sigma_{\rm pix})$ the template
+auto-block $\mathbf{M}_{TT}$ is recomputed \emph{exactly} (no $p=0$
+approximation), the full design $\mathbf{A}(\widehat p)$ is assembled, and the
+linear system \eqref{eq:profiledp2} is solved once more to deliver
+$\widehat{\boldsymbol\theta}=(\widehat{\mathbf{w}},\widehat{\mathbf{c}})$, the
+linear-parameter covariance $\mathbf{N}^{-1}$, and the exact $\chi^2$.
+
+\paragraph{Uncertainties.}
+The covariance of the nonlinear parameters follows from the curvature of the
+profiled objective at the optimum. For a least-squares $\chi^2$ the standard
+$\Delta\chi^2=1$ rule gives
+\begin{equation}
+  \operatorname{Cov}(\widehat p,\widehat\sigma_{\rm pix})
+  \;=\; 2\,\big[\mathbf{H}\big]^{-1},
+  \qquad
+  \mathbf{H} = \nabla^2\chi^2\big(\widehat p,\widehat\sigma_{\rm pix}\big),
+\end{equation}
+the factor $2$ arising because $\tfrac12\mathbf{H}$ is the Fisher information of
+the Gaussian likelihood $\propto\exp(-\chi^2/2)$. This covariance is propagated to
+the physical parameters $(v,R)$ by the Jacobian of
+$v=c(e^{p\delta}-1)$ and \eqref{eq:sigpix}; e.g.\ $\partial v/\partial p =
+c\,\delta\,e^{p\delta}$ and $\partial R/\partial\sigma_{\rm pix} =
+-R/\sigma_{\rm pix}$. When the data are consistent with no broadening
+($\widehat\sigma_{\rm pix}\!\to\!0$), $R$ is reported as a one-sided lower limit
+and only $v$ is refined.
+
+\paragraph{Degrees of freedom.}
+The reduced chi-square uses
+\begin{equation}
+  \mathrm{dof} \;=\; n_{\rm good} \;-\; (K+1) \;-\; (L+1) \;-\; n_{\rm nonlin},
+\end{equation}
+with $n_{\rm good}$ the number of unmasked pixels, $(K+1)$ template weights,
+$(L+1)$ continuum coefficients, and $n_{\rm nonlin}\in\{1,2\}$ the number of
+fitted nonlinear parameters ($p$ alone, or $p$ and $\sigma_{\rm pix}$).
+
+\begin{thebibliography}{9}
+\bibitem[Bolton et al.(2012)]{Bolton2012}
+  Bolton, A.~S., Schlegel, D.~J., Aubourg, \'E., et al.\ 2012,
+  ``Spectral Classification and Redshift Measurement for the SDSS-III
+  Baryon Oscillation Spectroscopic Survey,''
+  AJ, 144, 144.
+\bibitem[Cappellari(2017)]{Cappellari2017}
+  Cappellari, M.\ 2017,
+  ``Improving the full spectrum fitting method: accurate convolution with
+  Gauss--Hermite functions,''
+  MNRAS, 466, 798.
+\bibitem[Tonry \& Davis(1979)]{TonryDavis1979}
+  Tonry, J., \& Davis, M.\ 1979,
+  ``A survey of galaxy redshifts. I. Data reduction techniques,''
+  AJ, 84, 1511.
+\end{thebibliography}
+
+\end{document}
