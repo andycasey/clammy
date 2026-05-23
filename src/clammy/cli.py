@@ -177,6 +177,60 @@ def read_spectrum(path, wave_col, flux_col, sigma_col, ivar_col, mask_col, snr,
     return np.log(wave_ang), flux, sigma, good
 
 
+def _auto_vbary(path):
+    """Heliocentric velocity correction [km/s] inferred from a FITS header, or None.
+
+    Reads the target coordinates (RA_OBJ/DEC_OBJ, else RA/DEC), the epoch (MJD, else
+    MJD-OBS), and the observatory location (LON/LAT/ALT-OBS, else the named TELESCOP
+    site) and returns the heliocentric correction via astropy. Returns None for .npz
+    or whenever the needed keywords (or astropy) are unavailable -- the fit then
+    simply reports no barycentric-corrected velocity.
+    """
+    if not path or path.endswith(".npz"):
+        return None
+    try:
+        from astropy.io import fits
+        from astropy.coordinates import SkyCoord, EarthLocation
+        from astropy.time import Time
+        import astropy.units as u
+
+        with fits.open(path) as hdul:
+            hdrs = [h.header.copy() for h in hdul]
+
+        def get(*keys):
+            for h in hdrs:
+                for k in keys:
+                    if k in h and h[k] not in ("", None):
+                        return h[k]
+            return None
+
+        ra, dec, mjd = get("RA_OBJ", "RA"), get("DEC_OBJ", "DEC"), get("MJD", "MJD-OBS")
+        if ra is None or dec is None or mjd is None:
+            return None
+
+        loc, lon, lat, alt = None, get("LON-OBS"), get("LAT-OBS"), get("ALT-OBS")
+        if lon is not None and lat is not None:
+            # FITS LON-OBS is usually West-positive; EarthLocation wants East-positive.
+            # (Only the small diurnal term depends on this, so a best-effort sign is OK.)
+            lon_e = -float(lon) if float(lon) > 0 else float(lon)
+            loc = EarthLocation.from_geodetic(
+                lon_e * u.deg, float(lat) * u.deg, (float(alt or 0.0)) * u.m)
+        else:
+            tel = str(get("TELESCOP") or "")
+            if tel:
+                loc = EarthLocation.of_site(tel)  # may need a one-off site download
+        if loc is None:
+            return None
+
+        unit = (u.deg, u.deg) if isinstance(ra, (int, float)) else (u.hourangle, u.deg)
+        sc = SkyCoord(ra, dec, unit=unit)
+        v = sc.radial_velocity_correction(
+            "heliocentric", obstime=Time(float(mjd), format="mjd"), location=loc)
+        return float(v.to("km/s").value)
+    except Exception:
+        return None
+
+
 def _load_telluric_basis(path, loglam_fit):
     """Load a telluric basis and resample it onto the fitting grid.
 
@@ -281,6 +335,9 @@ def cmd_fit(args):
     if args.rescale_errors:
         print(f"\n(errors below rescaled by sqrt(chi2/dof) = {res.get('error_rescale', 1.0):.2f})")
 
+    # barycentric correction: use --vbary if given, else infer it from the FITS header.
+    vbary = args.vbary if args.vbary is not None else _auto_vbary(args.spectrum_file)
+
     print(f"\nv        = {res['v_kms']:+.3f} +/- {res['v_err_kms']:.3f} km/s")
     if args.fit_resolution:
         rl = "  (lower limit; unresolved)" if res.get("resolution_limited") else ""
@@ -302,10 +359,11 @@ def cmd_fit(args):
     if args.fit_telluric_shift:
         print(f"v_tell   = {res['v_tell_kms']:+.3f} +/- {res['v_tell_err_kms']:.3f} km/s   (telluric wavelength zero-point)")
         print(f"v_corr   = {res['v_corr_kms']:+.3f} +/- {res['v_corr_err_kms']:.3f} km/s   (zero-point-corrected RV)")
-    if args.vbary is not None:
+    if vbary is not None:
         _base = res.get("v_corr_kms", res["v_kms"])
         _lbl = "barycentric+telluric" if "v_corr_kms" in res else "barycentric"
-        print(f"v_final  = {_base + args.vbary:+.3f} km/s   ({_lbl}-corrected; vbary={args.vbary:+.3f})")
+        _src = "given" if args.vbary is not None else "auto from header"
+        print(f"v_final  = {_base + vbary:+.3f} km/s   ({_lbl}-corrected; vbary={vbary:+.3f}, {_src})")
     print(
         f"chi2/dof = {res['chi2_dof']:.3f}   "
         f"(chi2={res['chi2']:.1f}, dof={res['dof']}, n={res['n_good']})"
@@ -350,6 +408,9 @@ def cmd_fit(args):
             )
         if "u" in res:
             payload["u"] = res["u"].tolist()
+        if vbary is not None:
+            payload["vbary_kms"] = float(vbary)
+            payload["v_final_kms"] = float(res.get("v_corr_kms", res["v_kms"]) + vbary)
         with open(args.out, "w") as fh:
             json.dump(payload, fh, indent=2)
         print(f"wrote results -> {args.out}")
@@ -357,7 +418,7 @@ def cmd_fit(args):
     ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
     if args.plot:
         _plot_fit(loglam_b, flux, sigma, res, args.plot,
-                  source=os.path.basename(args.spectrum_file), ref=ref, vbary=args.vbary)
+                  source=os.path.basename(args.spectrum_file), ref=ref, vbary=vbary)
         print(f"wrote plot -> {args.plot}")
 
     if args.scan_plot:
@@ -669,7 +730,8 @@ def build_parser():
     pf.add_argument("--ref-v-err", type=float, default=None, help="uncertainty on --ref-v [km/s]")
     pf.add_argument("--ref-name", default="ref", help="label for --ref-v in the plot title")
     pf.add_argument("--vbary", type=float, default=None,
-                    help="barycentric velocity correction [km/s] to add to the (telluric-)corrected RV in the title/report")
+                    help="barycentric velocity correction [km/s]; if omitted it is computed "
+                    "automatically from the FITS header (RA/Dec/MJD/site) when possible")
     pf.add_argument("--rescale-errors", action="store_true",
                     help="rescale the formal RV errors by sqrt(chi2/dof) (reduced chi2 -> 1)")
     pf.set_defaults(func=cmd_fit)
