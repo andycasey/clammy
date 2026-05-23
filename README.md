@@ -31,9 +31,9 @@ $\mathbf{A}(\Delta x) = [\,\mathbf{T}(\Delta x) \mid \mathbf{P}\,]$ and weights
 $\mathbf{W} = \mathrm{diag}(W_i)$ on $\ln d$ ($W_i = (d_i/\sigma_i)^2$;
 masked px $\to W_i = 0$):
 
-$$\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix}, \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\,\ln d$$
+$$\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix} \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\,\ln d$$
 
-$$\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r}, \qquad \chi^2(\Delta x) = \|\ln d\|^2_{\mathbf{W}} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}$$
+$$\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r} \qquad \chi^2(\Delta x) = \|\ln d\|^2_{\mathbf{W}} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}$$
 
 This $\mathbf{W}$ is the inverse-variance weight of $\ln d$
 ($\sigma_{\ln d} \approx \sigma_d/d$; masked px get weight $0$), playing the role
@@ -41,7 +41,7 @@ of $\Sigma^{-1}$. The radial-velocity estimate is the global minimiser
 $\widehat{\Delta x} = \arg\min_{\Delta x} \chi^2(\Delta x)$, with
 $\widehat v = c\,(e^{\widehat{\Delta x}} - 1)$.
 
-**Speed**: $\mathbf{b}_T(\Delta x)$ and $\mathbf{M}_{TP}(\Delta x)$ are
+**Speed**: both $\mathbf{b}_T(\Delta x)$ and $\mathbf{M}_{TP}(\Delta x)$ are
 cross-correlations of fixed vectors against a shifted template → computed for all
 shifts at once via FFT. $\mathbf{M}_{PP}$, $\mathbf{b}_P$ are shift-independent;
 $\mathbf{M}_{TT}$ is only weakly shift-dependent (through the weights) so
@@ -53,8 +53,8 @@ correlation equal to the linear one over the valid region.
 **Resolution / convolution**: at constant resolving power $R$ the LSF is a Gaussian
 of constant width *in velocity* → constant pixels on the log grid → one Fourier
 multiply $\widehat T_k(\omega) \to \widehat T_k(\omega)\,\exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)$,
-with $\sigma_{\rm pix} = c/(f\,\mathrm{velscale}\,R)$, $\mathrm{velscale} = c\,\delta$
-the velocity per pixel and $f = 2\sqrt{2\ln 2}$. It can be fixed (known LSF,
+with $\sigma_{\rm pix} = c/(f\,\mathrm{velscale}\,R)$, where $\mathrm{velscale} = c\,\delta$
+is the velocity per pixel and $f = 2\sqrt{2\ln 2}$. It can be fixed (known LSF,
 pre-broaden once) or fit jointly with $v$ (`fit_resolution=True`) as a second
 nonlinear parameter — the model stays linear in $(\mathbf{w}, \mathbf{c})$ at fixed
 $(\Delta x, R)$. Caveat: the LSF convolves *linear* flux, but to keep the inner
@@ -90,7 +90,7 @@ kernel (both Fourier multiplies).
   Gray rotational profile of projected rotation velocity $v\sin i$ and linear
   limb-darkening coefficient $\epsilon$ (default $0.6$),
 
-  $$G(\Delta v) \;\propto\; 2\,(1-\epsilon)\sqrt{1-x^2} \;+\; \tfrac{\pi\epsilon}{2}\,(1-x^2), \qquad x = \Delta v / (v\sin i),\;\; |x| \le 1.$$
+  $$G(\Delta v) \;\propto\; 2\,(1-\epsilon)\sqrt{1-x^2} \;+\; \tfrac{\pi\epsilon}{2}\,(1-x^2) \qquad x = \Delta v / (v\sin i),\ |x| \le 1.$$
 
   On the log grid this is a fixed-pixel kernel, rfft'd once into a real transfer
   function that multiplies the stellar template FFTs — applied to the stellar block
