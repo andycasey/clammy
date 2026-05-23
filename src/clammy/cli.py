@@ -470,10 +470,21 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
         gridspec_kw={"height_ratios": [3, 1]},
     )
     ax[0].plot(lam[sl], flux[sl], lw=0.4, color="black", label="data")
-    ax[0].plot(lam[sl], res["model"][sl], lw=0.5, color="tab:red", label="model")
-    # the fitted Legendre continuum (smooth, multiplicative): exp(P . c) in linear flux
-    cont = np.exp(np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
-    ax[0].plot(lam[sl], cont[sl], lw=1.0, color="tab:orange", ls=":", label="continuum")
+    # decompose the (multiplicative) model: continuum, and the stellar / telluric
+    # absorption each applied ON the continuum. ln_cont/ln_star/ln_tell come from the
+    # fitter; fall back to recomputing the continuum from c if absent.
+    cont_ln = (np.asarray(res["ln_cont"]) if "ln_cont" in res
+               else np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
+    if "ln_tell" in res:
+        ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_tell"]) + cont_ln)[sl],
+                   lw=0.6, color="tab:blue", label="telluric × continuum")
+    if "ln_star" in res:
+        ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_star"]) + cont_ln)[sl],
+                   lw=0.6, color="tab:red", label="stellar × continuum")
+    else:
+        ax[0].plot(lam[sl], res["model"][sl], lw=0.6, color="tab:red", label="model")
+    ax[0].plot(lam[sl], np.exp(cont_ln)[sl], lw=1.0, color="tab:orange", ls="--",
+               label="continuum")
     # restrict both panels to where there is real (in-coverage, finite) data; the
     # resampled data is edge-clamped (finite) outside coverage, so use the `good` mask.
     valid = np.isfinite(flux)

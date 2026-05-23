@@ -872,10 +872,17 @@ def fit_rv(
         out["error_rescale"] = s
 
     if return_model:
-        ln_model = np.asarray(A @ jnp.asarray(theta))
+        A_np = np.asarray(A)
+        ln_model = A_np @ theta
         out["ln_model"] = ln_model
         out["model"] = np.exp(ln_model)
         out["lnd"] = lnd
         out["resid_lnd"] = np.where(good, lnd - ln_model, np.nan)
         out["good"] = good
+        # decompose the additive log-model into its blocks (shifted/broadened):
+        # stellar absorption, telluric absorption, and the Legendre continuum.
+        out["ln_star"] = A_np[:, :Ktot] @ theta[:Ktot]
+        out["ln_cont"] = A_np[:, Ktot + J_tell:] @ theta[Ktot + J_tell:]
+        if J_tell:
+            out["ln_tell"] = A_np[:, Ktot:Ktot + J_tell] @ theta[Ktot:Ktot + J_tell]
     return out
