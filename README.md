@@ -15,9 +15,9 @@ RV+weights and its convexity → continuum → convolution/R) is in
 
 ## Principle
 
-Resample to a uniform **log-wavelength** grid $x = \ln\lambda$, so a radial
+Resample to a uniform log-wavelength grid $x = \ln\lambda$, so a radial
 velocity $v$ acts as a pure translation $T_k(x) \to T_k(x - \Delta x)$ with
-$\Delta x = \ln(1 + v/c)$. Working in **log-flux** makes the
+$\Delta x = \ln(1 + v/c)$. Working in log-flux makes the
 (continuum $\times$ rectified-flux) model additive:
 
 $$\ln d(x) \;\approx\; \underbrace{\sum_{k=0}^{K} w_k\,T_k(x - \Delta x)}_{\text{rectified line basis}} \;+\; \underbrace{\sum_{m=0}^{L} c_m\,P_m(x)}_{\text{log-continuum}}$$
@@ -25,8 +25,8 @@ $$\ln d(x) \;\approx\; \underbrace{\sum_{k=0}^{K} w_k\,T_k(x - \Delta x)}_{\text
 The templates $\mathbf{T} = [\mu,\,\phi_1,\,\dots,\,\phi_K]$ are the basis of the
 *rectified* model grid (e.g. a mean $\mu \equiv T_0$ and PCA components
 $\phi_k \equiv T_k$); $P_m$ are Legendre polynomials. At fixed $\Delta x$ the model
-is **linear** in $\boldsymbol\theta = (\mathbf{w}, \mathbf{c})$, so we
-**solve linearly inside, scan $\Delta x$ outside**. With the design
+is linear in $\boldsymbol\theta = (\mathbf{w}, \mathbf{c})$, so we solve linearly
+inside, scan $\Delta x$ outside. With the design
 $\mathbf{A}(\Delta x) = [\,\mathbf{T}(\Delta x) \mid \mathbf{P}\,]$ and weights
 $\mathbf{W} = \mathrm{diag}(W_i)$ on $\ln d$ ($W_i = (d_i/\sigma_i)^2$;
 masked px $\to W_i = 0$):
@@ -42,30 +42,27 @@ $\widehat{\Delta x} = \arg\min_{\Delta x} \chi^2(\Delta x)$, with
 $\widehat v = c\,(e^{\widehat{\Delta x}} - 1)$.
 
 **Speed**: $\mathbf{b}_T(\Delta x)$ and $\mathbf{M}_{TP}(\Delta x)$ are
-cross-correlations of fixed vectors against a shifted template &rarr; computed for
-**all shifts at once via FFT**. $\mathbf{M}_{PP}$, $\mathbf{b}_P$ are
-shift-independent; $\mathbf{M}_{TT}$ is only weakly shift-dependent (through the
-weights) so $\mathbf{M}_{TT}(0)$ is used during the coarse scan, then
-$\mathbf{M}_{TT}$ is recomputed **exactly** at the refined shift. Circular-FFT wrap
-is eliminated by zeroing the data weights in a band of width = max lag at each
-edge, making the circular correlation equal to the linear one over the valid
-region.
+cross-correlations of fixed vectors against a shifted template → computed for all
+shifts at once via FFT. $\mathbf{M}_{PP}$, $\mathbf{b}_P$ are shift-independent;
+$\mathbf{M}_{TT}$ is only weakly shift-dependent (through the weights) so
+$\mathbf{M}_{TT}(0)$ is used during the coarse scan, then $\mathbf{M}_{TT}$ is
+recomputed exactly at the refined shift. Circular-FFT wrap is eliminated by zeroing
+the data weights in a band of width = max lag at each edge, making the circular
+correlation equal to the linear one over the valid region.
 
 **Resolution / convolution**: at constant resolving power $R$ the LSF is a Gaussian
-of constant width *in velocity* &rarr; constant pixels on the log grid &rarr; one
-Fourier multiply $\widehat T_k(\omega) \to \widehat T_k(\omega)\,
-\exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)$, with
-$\sigma_{\rm pix} = c/(f\,\mathrm{velscale}\,R)$ with $\mathrm{velscale} = c\,\delta$
-the velocity per pixel and $f = 2\sqrt{2\ln 2}$. It can be
-**fixed** (known LSF, pre-broaden once) or **fit jointly with $v$**
-(`fit_resolution=True`) as a second nonlinear parameter — the model stays linear in
-$(\mathbf{w}, \mathbf{c})$ at fixed $(\Delta x, R)$. Caveat: the LSF convolves
-*linear* flux, but to keep the inner solve linear we broaden the *log*-rectified
-templates; this matches the exact linear-flux convolution to first order and
-slightly over-deepens saturated cores (the toy uses the exact linear-flux
-convolution, so the validation measures the residual ~2% $R$ bias). For
-wavelength-dependent $R$/non-Gaussian LSFs, precompute banded convolution matrices
-on an $R$-grid and interpolate.
+of constant width *in velocity* → constant pixels on the log grid → one Fourier
+multiply $\widehat T_k(\omega) \to \widehat T_k(\omega)\,\exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)$,
+with $\sigma_{\rm pix} = c/(f\,\mathrm{velscale}\,R)$, $\mathrm{velscale} = c\,\delta$
+the velocity per pixel and $f = 2\sqrt{2\ln 2}$. It can be fixed (known LSF,
+pre-broaden once) or fit jointly with $v$ (`fit_resolution=True`) as a second
+nonlinear parameter — the model stays linear in $(\mathbf{w}, \mathbf{c})$ at fixed
+$(\Delta x, R)$. Caveat: the LSF convolves *linear* flux, but to keep the inner
+solve linear we broaden the *log*-rectified templates; this matches the exact
+linear-flux convolution to first order and slightly over-deepens saturated cores
+(the toy uses the exact linear-flux convolution, so the validation measures the
+residual ~2% $R$ bias). For wavelength-dependent $R$/non-Gaussian LSFs, precompute
+banded convolution matrices on an $R$-grid and interpolate.
 
 ### Extended forward model: tellurics, rotation, and native resolution
 
@@ -79,31 +76,31 @@ kernel (both Fourier multiplies).
 
 - **Tellurics.** Earth's atmosphere imprints absorption at *fixed observed
   wavelengths*, independent of the star's motion. So the telluric templates
-  $S_j = [\mathrm{tell}\,\mu,\,\mathrm{tell}\,\phi_1,\dots]$ live in the **observed
-  (topocentric) frame** and are **NOT** RV-shifted — they enter as
-  shift-independent columns alongside the Legendre continuum $P_m$, broadened by
-  the instrument LSF only. They contribute telluric weights $\mathbf{u}$ to
+  $S_j = [\mathrm{tell}\,\mu,\,\mathrm{tell}\,\phi_1,\dots]$ live in the observed
+  (topocentric) frame and are not RV-shifted — they enter as shift-independent
+  columns alongside the Legendre continuum $P_m$, broadened by the instrument LSF
+  only. They contribute telluric weights $\mathbf{u}$ to
   $\boldsymbol\theta = (\mathbf{w}, \mathbf{u}, \mathbf{c})$. The fixed block is
-  generalised from $\mathbf{P}$ to $\mathbf{F} = [\,G_{\rm inst}\mathbf{S} \mid
-  \mathbf{P}\,]$, so $\mathbf{M}_{FF}, \mathbf{b}_F$ change only when the telluric
-  broadening changes; when no telluric basis is supplied, $\mathbf{F} = \mathbf{P}$
-  and every code path reduces to the stellar-only case.
+  generalised from $\mathbf{P}$ to $\mathbf{F} = [\,G_{\rm inst}\mathbf{S} \mid \mathbf{P}\,]$,
+  so $\mathbf{M}_{FF}, \mathbf{b}_F$ change only when the telluric broadening
+  changes; when no telluric basis is supplied, $\mathbf{F} = \mathbf{P}$ and every
+  code path reduces to the stellar-only case.
 
-- **Rotation ($v\sin i$).** Stellar templates may additionally be convolved by a
+- **Rotation** ($v\sin i$). Stellar templates may additionally be convolved by a
   Gray rotational profile of projected rotation velocity $v\sin i$ and linear
   limb-darkening coefficient $\epsilon$ (default $0.6$),
 
   $$G(\Delta v) \;\propto\; 2\,(1-\epsilon)\sqrt{1-x^2} \;+\; \tfrac{\pi\epsilon}{2}\,(1-x^2), \qquad x = \Delta v / (v\sin i),\;\; |x| \le 1.$$
 
   On the log grid this is a fixed-pixel kernel, rfft'd once into a real transfer
-  function that multiplies the stellar template FFTs — applied to the **stellar
-  block only**, never to tellurics or continuum. It can be fixed or fit
-  (`fit_vsini=True`); reported as `vsini_kms` ± err, with an unresolved
-  lower-limit flag when the optimum lands at the search floor.
+  function that multiplies the stellar template FFTs — applied to the stellar block
+  only, never to tellurics or continuum. It can be fixed or fit (`fit_vsini=True`);
+  reported as `vsini_kms` ± err, with an unresolved lower-limit flag when the
+  optimum lands at the search floor.
 
-- **Native resolution.** Each basis records the **native resolving power** $R$ it
-  was built from. The fitter broadens **differentially in quadrature**, so a basis
-  of native dispersion $\sigma_{\rm native}$ is taken to the observed instrument
+- **Native resolution.** Each basis records the native resolving power $R$ it was
+  built from. The fitter broadens differentially in quadrature, so a basis of
+  native dispersion $\sigma_{\rm native}$ is taken to the observed instrument
   dispersion $\sigma_{\rm obs}$ via
 
   $$\sigma_{\rm diff}^2 = \max\!\big(0,\; \sigma_{\rm obs}^2 - \sigma_{\rm native}^2\big).$$
@@ -114,13 +111,14 @@ kernel (both Fourier multiplies).
   $R_{\rm native} = \infty$ (the default) gives $\sigma_{\rm native} = 0$ and
   reproduces the full single-Gaussian broadening.
 
-**Refinement / optimisation**: a coarse FFT scan over `Δx` (and a coarse `R` grid)
-locates the global basin (the profiled χ² is multimodal in the nonlinear
-parameters, though convex in `(w,c)` at fixed `Δx,R`); then a **JAX-autodiff
-modified-Newton** with a backtracking Armijo line search polishes `(Δx[, R])` on the
-*profiled* χ². The parameter covariance is the autodiff Hessian of the profiled χ²
-at the optimum (Δχ² = 1), propagated to `(v, R)`. Typical warm cost ≈ 2 s/fit (CPU;
-the bottleneck is the 216k-point FFT, ~10× faster on GPU).
+**Refinement / optimisation**: a coarse FFT scan over $\Delta x$ (and a coarse $R$
+grid) locates the global basin (the profiled $\chi^2$ is multimodal in the
+nonlinear parameters, though convex in $(\mathbf{w}, \mathbf{c})$ at fixed
+$(\Delta x, R)$); then a JAX-autodiff modified-Newton with a backtracking Armijo
+line search polishes $(\Delta x[, R])$ on the *profiled* $\chi^2$. The parameter
+covariance is the autodiff Hessian of the profiled $\chi^2$ at the optimum
+($\Delta\chi^2 = 1$), propagated to $(v, R)$. Typical warm cost ≈ 2 s/fit (CPU; the
+bottleneck is the 216k-point FFT, ~10× faster on GPU).
 
 ## Layout
 
@@ -149,31 +147,6 @@ Install:
 ```bash
 uv pip install -e .            # or: pip install -e .   (add [templates] for ppxf)
 ```
-
-## Data
-
-198 PHOENIX-ACES synthetic spectra (`convolved/dmost_lte_{teff}_{logg}_{feh}_.fits`),
-already log-rebinned to one shared grid: **216,058 px, 6000–9600 Å (air), 0.652
-km/s/px**. Coverage: Teff ∈ {2500…8000 K} (11), log g ∈ {1, 3, 5}, [Fe/H] ∈ {0,
-−0.5, −1, −2, −3, −4}. The raw HiRes inputs live in `original/`. Downloaded by
-`download_phoenix_templates.sh` and convolved/resampled by
-`process_phoenix_templates.py` (`original/ → convolved/`).
-
-## Package `clammy/`
-
-| module | task | what it does |
-|--------|------|--------------|
-| `grid.py`   | —      | load the grid into a `(n_spec, n_pix)` flux matrix on the shared log-λ grid; `load_grid` parses stellar labels, `load_spectra` is the label-agnostic loader for telluric grids |
-| `basis.py`  | Task 1 | robust log-space continuum rectification + PCA (Gram-matrix trick); save/load Φ, μ, grid + `frame` (rest/observed) + native `resolution`; `build_telluric_basis` builds the same way for the observed-frame telluric case |
-| `toy.py`    | Task 2 | Fourier sub-pixel RV shift + linear-flux R- and vsini-broadening + observed-frame tellurics + Legendre log-continuum + noise; optional resample to a different grid |
-| `fitter.py` | Task 3 | the JAX fitter: FFT cross-correlations, `vmap`'d normal-equation scan, joint `(v[, R][, vsini])` autodiff modified-Newton refine + covariance; observed-frame telluric block; differential native-resolution broadening |
-| `cli.py`    | —      | the `clammy build` / `clammy fit` CLI (stellar **and** telluric bases; the four broadening modes) |
-| `paths.py`  | —      | single source-of-truth for `original/`, `convolved/`, `outputs/` (env-overridable) |
-
-Rectification removes the smooth pseudo-continuum so PCA captures **lines**, while
-the fitter's Legendre block carries the continuum — keeping the two roles separate
-avoids the template/continuum degeneracy. The mean spectrum μ is a free-weight
-template, so it is RV-shifted like any component.
 
 ## Usage
 
@@ -214,8 +187,8 @@ clammy fit basis.npz spec.fits                               # 3. nothing (alrea
 clammy fit basis.npz spec.fits --fit-vsini                   # 4. vsini only (R assumed right)
 ```
 
-1. **fit R + vsini together** — the instrument LSF is applied to **both** the
-   stellar and telluric blocks; the rotation kernel to the **stellar block only**.
+1. **fit R + vsini together** — the instrument LSF is applied to both the stellar
+   and telluric blocks; the rotation kernel to the stellar block only.
 2. **fixed R, no vsini** — a known instrument LSF is applied (once) to both
    blocks; no rotation.
 3. **nothing** — assume the templates are already at the right resolution.
@@ -348,7 +321,7 @@ res = fitter.fit_rv(
 res["u"]  # telluric template weights
 ```
 
-The fitter broadens each block **differentially in quadrature**,
+The fitter broadens each block differentially in quadrature,
 $\sigma_{\rm diff}^2 = \max(0,\,\sigma_{\rm obs}^2 - \sigma_{\rm native}^2)$, so
 stellar and telluric grids built at different native resolutions are handled
 correctly; the default `np.inf` means "effectively unresolved" and reproduces full
@@ -359,9 +332,9 @@ broadening.
 
 Leave-one-out (basis never saw the test star; metal-poor RGB, Teff 4500 / log g 1 / [Fe/H] −2):
 
-- **RV** — bias ≤ 10 m/s at SNR 5, errors well-calibrated (realised scatter ≈ predicted), χ²/dof ≈ 1 at low SNR; at high SNR χ²/dof rises (the expected **PCA-truncation floor**, since K=14 components cannot perfectly represent a held-out star) while RV bias stays ~1–2 m/s. RV-vs-velocity sweep (−300…+300 km/s): max\|bias\| = 3 m/s. *(In-basis truth gives RV bias < 0.4 m/s and χ²/dof = 1 at all SNR.)*
+- **RV** — bias ≤ 10 m/s at SNR 5, errors well-calibrated (realised scatter ≈ predicted), χ²/dof ≈ 1 at low SNR; at high SNR χ²/dof rises (the expected PCA-truncation floor, since K=14 components cannot perfectly represent a held-out star) while RV bias stays ~1–2 m/s. RV-vs-velocity sweep (−300…+300 km/s): max\|bias\| = 3 m/s. *(In-basis truth gives RV bias < 0.4 m/s and χ²/dof = 1 at all SNR.)*
 - **Continuum / basis** — continuum order ≥ 3 suffices (χ²/dof plateaus); larger K lowers the truncation floor (χ²/dof: 3.0 at K=1 → 1.6 at K=14 → 1.1 at K=30).
-- **Resolution** — `v` and `R` are nearly orthogonal (ρ_vR ≈ 0) and errors are well-calibrated (realised scatter ≈ predicted for both). Two bias regimes: with an *in-basis* truth, `R` is biased only **−2%** (the log-space-vs-linear-flux convolution approximation; a log-broadened toy is recovered to 0.1%). With a *held-out* star (realistic template mismatch), `R` is biased **+11…16%** and freeing `R` also leaks mismatch into `v` (tens–hundreds of m/s, dominating at high SNR). **Takeaway: R from this fit is degenerate with template completeness — trust it to ~15% unless the basis represents the target well.** A different/coarser observed grid is handled by resampling onto the template grid (point estimates recovered; resampling correlates noise, so χ²/dof and error bars need the proper covariance).
+- **Resolution** — `v` and `R` are nearly orthogonal (ρ_vR ≈ 0) and errors are well-calibrated (realised scatter ≈ predicted for both). Two bias regimes: with an *in-basis* truth, `R` is biased only −2% (the log-space-vs-linear-flux convolution approximation; a log-broadened toy is recovered to 0.1%). With a *held-out* star (realistic template mismatch), `R` is biased +11…16% and freeing `R` also leaks mismatch into `v` (tens–hundreds of m/s, dominating at high SNR). Takeaway: R from this fit is degenerate with template completeness — trust it to ~15% unless the basis represents the target well. A different/coarser observed grid is handled by resampling onto the template grid (point estimates recovered; resampling correlates noise, so χ²/dof and error bars need the proper covariance).
 - **Tellurics** — on toy data with telluric absorption injected in the observed frame, adding the observed-frame telluric block sharply reduces the RV bias that an unmodelled telluric otherwise induces (the unmodelled case shows a strongly inflated χ²/dof that the telluric columns absorb back to ≈ 1), since the telluric features are held fixed in the observed frame and so do not pull on the RV. The telluric weights `u` are returned alongside the stellar weights.
 - **vsini** — the Gray rotational profile (limb-darkening `epsilon`, default 0.6) is recovered when the coarse search brackets the true `vsini` (demonstrated on toy data); when the rotation is below the velocity sampling the optimum lands at the search floor and `vsini` is reported as a `vsini_limited` lower limit. As with `R`, freeing `vsini` against a held-out star trades against template mismatch, so treat a fitted `vsini` as informative only when the basis represents the target well.
 
