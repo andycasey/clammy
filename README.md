@@ -94,6 +94,25 @@ so $`\mathbf{M}_{FF}, \mathbf{b}_F`$ change only when the telluric broadening
 changes; when no telluric basis is supplied, $`\mathbf{F} = \mathbf{P}`$ and every
 code path reduces to the stellar-only case.
 
+**Telluric shift / wavelength zero-point.** Spectrographs like DEIMOS carry a
+slit-dependent wavelength zero-point error (uncorrected flexure): an overall shift of
+the observed wavelength scale. Since the tellurics are at rest in the observer frame,
+their apparent shift measures that zero-point directly. With `--fit-telluric-shift`
+(`fit_telluric_shift=True`) the telluric block gets its own velocity
+$`\Delta x_{\rm tell}`$ — a Fourier phase ramp on its FFTs, just like the stellar RV —
+refined jointly with the other nonlinear parameters. The stellar shift absorbs both
+the true RV and the zero-point ($`p_{\rm star} = p_{\rm true} + p_0`$) while the
+tellurics measure the zero-point alone ($`p_{\rm tell} = p_0`$), so the corrected RV
+is the lag difference
+
+```math
+v_{\rm corr} = c \left( e^{(p_{\rm star} - p_{\rm tell})\delta} - 1 \right),
+```
+
+reported as `v_corr_kms` alongside the telluric velocity `v_tell_kms`. Adding a
+barycentric correction then places it in the heliocentric frame — reproducing the
+telluric/sky-line wavelength recalibration used by DEIMOS pipelines (e.g. dmost).
+
 **Rotation** ($`v\sin i`$). Stellar templates may additionally be convolved by a
 Gray rotational profile of projected rotation velocity $`v\sin i`$ and linear
 limb-darkening coefficient $`\epsilon`$ (default $`0.6`$),
@@ -127,10 +146,13 @@ reproduces the full single-Gaussian broadening.
 grid) locates the global basin (the profiled $`\chi^2`$ is multimodal in the
 nonlinear parameters, though convex in $`(\mathbf{w}, \mathbf{c})`$ at fixed
 $`(\Delta x, R)`$); then a JAX-autodiff modified-Newton with a backtracking Armijo
-line search polishes $`(\Delta x[, R])`$ on the *profiled* $`\chi^2`$. The parameter
-covariance is the autodiff Hessian of the profiled $`\chi^2`$ at the optimum
-($`\Delta\chi^2 = 1`$), propagated to $`(v, R)`$. Typical warm cost ≈ 2 s/fit (CPU; the
-bottleneck is the 216k-point FFT, ~10× faster on GPU).
+line search polishes $`(\Delta x[, R])`$ on the *profiled* $`\chi^2`$. Rotation
+$`v\sin i`$ and the telluric shift $`\Delta x_{\rm tell}`$ are refined the same way;
+the telluric zero-point is small and unimodal, so (unlike $`\Delta x`$) it is *not*
+coarse-scanned — just initialised at 0 and Newton-refined. The parameter covariance
+is the autodiff Hessian of the profiled $`\chi^2`$ at the optimum
+($`\Delta\chi^2 = 1`$), propagated to $`(v, R, v\sin i, v_{\rm tell})`$. Typical warm
+cost ≈ 2 s/fit (CPU; the bottleneck is the 216k-point FFT, ~10× faster on GPU).
 
 ## Layout
 

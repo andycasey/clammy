@@ -97,7 +97,10 @@ $P_m$                & vector    & $m$-th Legendre continuum column, $m=0,\dots,
 $\mathbf{P}$         & $n\times(L{+}1)$ & continuum design block \\
 $L$                  & scalar    & continuum (Legendre) order \\
 $\mathbf{c}=(c_0,\dots,c_L)$ & vector & continuum coefficients \\[2pt]
-$\mathbf{A}$         & $n\times D$ & full design matrix $[\,\mathbf{T}\mid\mathbf{P}\,]$, $D=(K{+}1)+(L{+}1)$ \\
+$S_j,\;\mathbf{S}$   & vector, $n\times(J{+}1)$ & telluric templates / block (observed frame, not RV-shifted) \\
+$\mathbf{u}=(u_0,\dots,u_J)$ & vector & telluric weights \\
+$p_{\rm tell}$       & pixels    & telluric lag (instrument wavelength zero-point) \\[2pt]
+$\mathbf{A}$         & $n\times D$ & full design $[\,\mathbf{T}\mid\mathbf{P}\,]$ (or $[\,\mathbf{T}\mid\mathbf{S}\mid\mathbf{P}\,]$ with tellurics) \\
 $\boldsymbol\theta=(\mathbf{w},\mathbf{c})$ & vector & full linear parameter vector \\
 $\mathbf{N}=\mathbf{A}^\T\mathbf{C}^{-1}\mathbf{A}$ & matrix & normal matrix \\
 $\mathbf{r}=\mathbf{A}^\T\mathbf{C}^{-1}\mathbf{Y}$ & vector & right-hand side \\
@@ -527,6 +530,64 @@ at fit time, retaining the linear inner solve at the cost of the single-multiply
 FFT shortcut.
 
 % ============================================================================
+\section{Tellurics and the instrument wavelength zero-point}
+\label{sec:tellurics}
+% ============================================================================
+Telluric absorption from Earth's atmosphere is imprinted at \emph{fixed observed
+(topocentric) wavelengths}, independent of the star's motion. We model it with a
+second rectified basis $\mathbf{S}=[\,S_0\mid S_1\mid\cdots\mid S_J\,]$, built
+exactly as the stellar templates (log-rectify $+$ PCA) but from a grid of telluric
+transmission models. Because the tellurics do not share the stellar Doppler shift,
+$\mathbf{S}$ is \emph{not} translated by $\dx$; like the continuum it enters the
+design as shift-independent columns, broadened by the instrument LSF only (no
+rotational broadening). The forward model \eqref{eq:fullmodel} becomes
+\begin{equation}
+  Y(x) \;=\; \underbrace{\sum_{k} w_k\,T_k(x-\dx)}_{\text{stellar}}
+  \;+\; \underbrace{\sum_{j} u_j\,S_j(x)}_{\text{telluric (observed frame)}}
+  \;+\; \underbrace{\sum_{m} c_m\,P_m(x)}_{\text{continuum}},
+\end{equation}
+with the design augmented to
+$\mathbf{A}(p)=[\,\mathbf{T}(p)\mid\mathbf{S}\mid\mathbf{P}\,]$ and the linear vector
+to $\boldsymbol\theta=(\mathbf{w},\mathbf{u},\mathbf{c})$. The telluric and continuum
+blocks are shift-independent, so their normal-equation contributions are precomputed
+once; only the stellar auto- and cross-blocks depend on $p$, and the separable
+scan/solve is otherwise unchanged.
+
+\paragraph{The wavelength zero-point.}
+Real spectrographs carry a slit-dependent \emph{wavelength zero-point} error (e.g.\
+uncorrected flexure on Keck/DEIMOS): an overall shift of the observed wavelength
+scale by some lag $p_0$. The stellar template then matches the data at
+$p_{\rm star}=p_{\rm true}+p_0$, conflating the true Doppler shift with the
+instrumental zero-point. Because the tellurics are at rest in the observer frame,
+their apparent shift measures $p_0$ \emph{directly}. We therefore optionally promote
+a telluric lag $p_{\rm tell}$ to a further nonlinear parameter: the telluric columns
+are translated by a Fourier phase ramp,
+$\widehat{S}_j(\omega)\to\widehat{S}_j(\omega)\,e^{-2\pi i\omega p_{\rm tell}}$,
+exactly as the stellar templates are translated by $p$ (Section~\ref{sec:fft}). At
+fixed $(p,R,p_{\rm tell})$ the model is still linear in
+$(\mathbf{w},\mathbf{u},\mathbf{c})$, so the same separable least squares applies.
+
+Unlike the radial velocity $p$ --- whose profiled $\chi^2$ is multimodal and so
+requires the global FFT scan of Section~\ref{sec:fft} --- the zero-point is small
+and its surface is smooth and unimodal near $p_{\rm tell}=0$. We therefore do
+\emph{not} add a coarse grid dimension for it: the coarse scan keeps the tellurics at
+$p_{\rm tell}=0$ (in the shift-independent block) to locate the $(p,R)$ basin, and
+$p_{\rm tell}$ is initialised at $0$ and refined \emph{jointly} with the other
+nonlinear parameters by the autodiff Newton step of Section~\ref{sec:opt}.
+
+\paragraph{Zero-point-corrected velocity.}
+Since $p_{\rm star}=p_{\rm true}+p_0$ and $p_{\rm tell}=p_0$, the instrumental
+zero-point cancels in the \emph{difference}, giving the corrected radial velocity
+\begin{equation}
+  \widehat v_{\rm corr} \;=\; c\,\Big(e^{(p_{\rm star}-p_{\rm tell})\,\delta}-1\Big),
+  \label{eq:vcorr}
+\end{equation}
+with its uncertainty propagated from the joint $(p_{\rm star},p_{\rm tell})$ block of
+the nonlinear-parameter covariance. A barycentric correction is then added to place
+$\widehat v_{\rm corr}$ in the heliocentric frame. This reproduces the telluric/
+sky-line wavelength recalibration used by DEIMOS pipelines (e.g.\ \texttt{dmost}).
+
+% ============================================================================
 \section{Optimisation and uncertainties}
 \label{sec:opt}
 % ============================================================================
@@ -585,11 +646,13 @@ and only $v$ is refined.
 \paragraph{Degrees of freedom.}
 The reduced chi-square uses
 \begin{equation}
-  \mathrm{dof} \;=\; n_{\rm good} \;-\; (K+1) \;-\; (L+1) \;-\; n_{\rm nonlin},
+  \mathrm{dof} \;=\; n_{\rm good} \;-\; (K+1) \;-\; (J+1) \;-\; (L+1) \;-\; n_{\rm nonlin},
 \end{equation}
-with $n_{\rm good}$ the number of unmasked pixels, $(K+1)$ template weights,
-$(L+1)$ continuum coefficients, and $n_{\rm nonlin}\in\{1,2\}$ the number of
-fitted nonlinear parameters ($p$ alone, or $p$ and $\sigma_{\rm pix}$).
+with $n_{\rm good}$ the number of unmasked pixels, $(K+1)$ template weights, the
+$(J+1)$ telluric weights when a telluric basis is used (otherwise drop this term),
+$(L+1)$ continuum coefficients, and $n_{\rm nonlin}$ the number of fitted nonlinear
+parameters: the RV shift $p$, plus optionally the resolution $\sigma_{\rm pix}$, the
+rotation $v\sin i$, and the telluric shift $p_{\rm tell}$.
 
 \begin{thebibliography}{9}
 \bibitem[Bolton et al.(2012)]{Bolton2012}
