@@ -188,27 +188,31 @@ def _solve_exact(A, W, lnd, ridge):
     return theta, cov, chi2
 
 
-@partial(jax.jit, static_argnames=("n", "fit_R", "fit_vsini"))
+@partial(jax.jit, static_argnames=("n", "fit_R", "fit_vsini", "fit_tell"))
 def _profiled_chi2(x, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
                    sig_nat_star, sig_nat_tell, sig_obs_fixed,
-                   vsini_fixed, epsilon, n, fit_R, fit_vsini):
+                   vsini_fixed, epsilon, n, fit_R, fit_vsini, fit_tell):
     """Profiled chi2 as a function of the variable-length nonlinear vector x.
 
     The nonlinear vector is ``x = [p]`` followed by ``sigma_obs_pix`` (only if
-    ``fit_R``) and ``vsini_pix`` (only if ``fit_vsini``), in that order. Inactive
-    broadening params take their fixed values (``sig_obs_fixed`` / ``vsini_fixed``;
-    0 means OFF). The RV shift p enters as a Fourier phase ramp.
+    ``fit_R``), ``vsini_pix`` (only if ``fit_vsini``), and ``p_tell`` (only if
+    ``fit_tell``), in that order. Inactive broadening params take their fixed
+    values (``sig_obs_fixed`` / ``vsini_fixed``; 0 means OFF). The stellar RV
+    shift p enters as a Fourier phase ramp; the telluric lag p_tell (when active)
+    enters as a SEPARATE phase ramp on the telluric block.
 
     Transfer functions are reconstructed each call:
       * stellar:  Gauss(diff_star(sigma_obs_pix)) * g_rot(vsini_pix)
       * telluric: Gauss(diff_tell(sigma_obs_pix))
     where diff_*(.) is the differential native-resolution Gaussian. The design is
-    ``A = [stellar_shifted_broadened, telluric_broadened, P]`` (the telluric block
-    is absent when ``Sf`` has zero columns). The stellar template weights, telluric
-    weights, and continuum are profiled out by the exact linear solve, so this is
-    the marginal surface -- differentiable end-to-end so JAX supplies grad and
-    Hessian. Big arrays are arguments (not closed-over) so jit compiles once and is
-    reused across fits of identical shape.
+    ``A = [stellar_shifted_broadened, telluric_broadened(, shifted), P]`` (the
+    telluric block is absent when ``Sf`` has zero columns). The telluric block is
+    instrument-broadened only (NO rotation) and, when ``fit_tell``, additionally
+    shifted by p_tell via ``exp(-2 pi i freq p_tell)``. The stellar template
+    weights, telluric weights, and continuum are profiled out by the exact linear
+    solve, so this is the marginal surface -- differentiable end-to-end so JAX
+    supplies grad and Hessian. Big arrays are arguments (not closed-over) so jit
+    compiles once and is reused across fits of identical shape.
     """
     idx = 1
     if fit_R:
@@ -230,9 +234,14 @@ def _profiled_chi2(x, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
     phase = jnp.exp(-2j * jnp.pi * freq * x[0])
     T_sb = jnp.fft.irfft(Tfb * phase[:, None], n=n, axis=0)
 
-    # telluric block (shift-independent), broadened by the differential Gaussian
-    g_tell = _gauss_tf(freq, _diff_sigma(sigma_obs_pix, sig_nat_tell))
-    S_b = jnp.fft.irfft(Sf * g_tell[:, None], n=n, axis=0)
+    # telluric block, broadened by the differential Gaussian (no rotation), and
+    # optionally shifted by the telluric lag p_tell (the instrument wavelength
+    # zero-point) via a second Fourier phase ramp.
+    Sfb = Sf * _gauss_tf(freq, _diff_sigma(sigma_obs_pix, sig_nat_tell))[:, None]
+    if fit_tell:
+        tell_phase = jnp.exp(-2j * jnp.pi * freq * x[idx])
+        Sfb = Sfb * tell_phase[:, None]
+    S_b = jnp.fft.irfft(Sfb, n=n, axis=0)
 
     A = jnp.concatenate([T_sb, S_b, Pj], axis=1)
     N = A.T @ (Wj[:, None] * A) + ridge * jnp.eye(A.shape[1])
@@ -240,30 +249,30 @@ def _profiled_chi2(x, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
     return const - r @ jnp.linalg.solve(N, r)
 
 
-@partial(jax.jit, static_argnames=("n", "fit_R", "fit_vsini", "max_iter", "max_ls"))
+@partial(jax.jit, static_argnames=("n", "fit_R", "fit_vsini", "fit_tell", "max_iter", "max_ls"))
 def _newton_jit(x0, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
                 sig_nat_star, sig_nat_tell, sig_obs_fixed, vsini_fixed, epsilon,
-                n, fit_R, fit_vsini, max_iter=15, max_ls=25, c1=1e-4,
+                n, fit_R, fit_vsini, fit_tell, max_iter=15, max_ls=25, c1=1e-4,
                 shrink=0.5, ftol=1e-2):
     """Damped-Newton minimiser of the profiled chi2, fully fused in XLA.
 
     Operates on the variable-length nonlinear vector x = [p (, sigma_obs_pix)
-    (, vsini_pix)] (slots present per the ``fit_R``/``fit_vsini`` static flags).
-    Each step uses the JAX-autodiff gradient and (one) Hessian; the Hessian is
-    floored to positive-definite (Levenberg-Marquardt), the step is forced to be a
-    descent direction, and its length satisfies the Armijo sufficient-decrease
-    condition via a backtracking line search. A `while_loop` stops as soon as the
-    chi2 decrease drops below `ftol` -- there is no point refining far below
-    Delta-chi2 = 1, and the FFT-based gradient/Hessian are the expensive part, so
-    we take as few steps as possible (~3-5 from the coarse-scan start). The whole
-    optimiser is one jitted program (no per-iteration host syncs).
-    Returns (x_opt, Hessian_at_opt).
+    (, vsini_pix) (, p_tell)] (slots present per the ``fit_R``/``fit_vsini``/
+    ``fit_tell`` static flags). Each step uses the JAX-autodiff gradient and (one)
+    Hessian; the Hessian is floored to positive-definite (Levenberg-Marquardt),
+    the step is forced to be a descent direction, and its length satisfies the
+    Armijo sufficient-decrease condition via a backtracking line search. A
+    `while_loop` stops as soon as the chi2 decrease drops below `ftol` -- there is
+    no point refining far below Delta-chi2 = 1, and the FFT-based gradient/Hessian
+    are the expensive part, so we take as few steps as possible (~3-5 from the
+    coarse-scan start). The whole optimiser is one jitted program (no
+    per-iteration host syncs). Returns (x_opt, Hessian_at_opt).
     """
     def obj(x):
         return _profiled_chi2(x, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
                               sig_nat_star, sig_nat_tell, sig_obs_fixed,
                               vsini_fixed, epsilon, n=n, fit_R=fit_R,
-                              fit_vsini=fit_vsini)
+                              fit_vsini=fit_vsini, fit_tell=fit_tell)
 
     vg = jax.value_and_grad(obj)
     hess = jax.hessian(obj)
@@ -327,6 +336,7 @@ def fit_rv(
     R_native_star=np.inf,
     R_native_tell=np.inf,
     tell_basis=None,
+    fit_telluric_shift=False,
     vsini=None,
     fit_vsini=False,
     vsini_bounds=(1.0, 300.0),
@@ -360,6 +370,20 @@ def fit_rv(
                                grid as the data. NOT RV-shifted; gets instrument
                                (not rotational) broadening. Adds telluric weights
                                `u` to the solution. None = no telluric block.
+    fit_telluric_shift : bool  OPTIONAL. When True (requires `tell_basis`), fit a
+                               telluric velocity lag `p_tell` jointly with the
+                               stellar RV. Tellurics are at rest in the observer
+                               frame, so a nonzero telluric velocity IS the
+                               instrument wavelength zero-point (e.g. DEIMOS slit
+                               flexure). The stellar RV inherits the same
+                               zero-point, so the corrected stellar velocity comes
+                               from the lag DIFFERENCE (p_star - p_tell). The
+                               coarse scan keeps the telluric at p_tell=0 (in the
+                               fixed block); p_tell is initialised to 0 and refined
+                               jointly by the damped-Newton step. The telluric
+                               block is then shifted by `exp(-2 pi i freq p_tell)`,
+                               instrument-broadened only (no rotation). Reports
+                               `v_tell_kms`, `v_corr_kms` (and their errors).
 
     vsini : float|None         FIXED projected rotation velocity (km/s) for the
                                stellar block. None = no rotation unless `fit_vsini`.
@@ -390,7 +414,11 @@ def fit_rv(
     sp_grid, resolution_limited. When vsini is fit: vsini_kms, vsini_err_kms,
     vsini_limited (True when the optimum is at the lower bound -> lower limit /
     unresolved rotation); a fixed `vsini` is echoed as vsini_kms. When a telluric
-    basis is used: u (telluric weights). The joint covariance among the active
+    basis is used: u (telluric weights). When `fit_telluric_shift`: v_tell_kms,
+    v_tell_err_kms (the telluric velocity = instrument wavelength zero-point) and
+    v_corr_kms, v_corr_err_kms (the stellar RV with that zero-point removed, from
+    the lag difference p_star - p_tell). v_kms always remains the RAW stellar shift
+    (observed frame). The joint covariance among the active
     nonlinear params (v and whichever of R/vsini are fit) is `cov_nl`; `cov_vR`
     keeps its 2x2 (v,R) semantics when only R is fit.
     """
@@ -429,8 +457,15 @@ def fit_rv(
     P = _legendre_design(loglam, cont_order)
     L1 = P.shape[1]
 
-    # telluric block S = [tell_mu, tell_Phi]^T (observed frame, NOT shifted).
+    # telluric block S = [tell_mu, tell_Phi]^T (observed frame). NOT shifted unless
+    # fit_telluric_shift -> then it carries its own (small) wavelength-zero-point lag.
     use_tell = tell_basis is not None
+    if fit_telluric_shift and not use_tell:
+        raise ValueError(
+            "fit_telluric_shift=True requires a telluric basis (tell_basis); "
+            "got tell_basis=None."
+        )
+    fit_tell = bool(fit_telluric_shift and use_tell)
     if use_tell:
         tell_mu, tell_Phi = tell_basis
         tell_mu = np.asarray(tell_mu, float)
@@ -508,13 +543,22 @@ def fit_rv(
         MTF = jnp.stack(cols, axis=-1)
         return np.asarray(_quad_forms(MTF, bT, M_TT0, M_FF, b_F, float(ridge)))
 
-    def _exact_at(p, sigma_obs_pix, vsini_pix):
-        """Exact profiled solve at sub-pixel shift p and given broadening."""
+    def _exact_at(p, sigma_obs_pix, vsini_pix, p_tell=0.0):
+        """Exact profiled solve at sub-pixel shift p and given broadening.
+
+        When the telluric block is active it is broadened and (if a telluric lag
+        ``p_tell`` is supplied) shifted by ``exp(-2 pi i freq p_tell)`` -- matching
+        the shift the profiled chi2 / Newton refine applies.
+        """
         gT = star_tf(sigma_obs_pix, vsini_pix)
         phase = jnp.exp(-2j * np.pi * freq * float(p))
         T_sb = jnp.fft.irfft(Tf * gT[:, None] * phase[:, None], n=n, axis=0)
         if J_tell:
-            S_b = jnp.fft.irfft(Sf * tell_tf(sigma_obs_pix)[:, None], n=n, axis=0)
+            Sfb = Sf * tell_tf(sigma_obs_pix)[:, None]
+            if p_tell:
+                tell_phase = jnp.exp(-2j * np.pi * freq * float(p_tell))
+                Sfb = Sfb * tell_phase[:, None]
+            S_b = jnp.fft.irfft(Sfb, n=n, axis=0)
             A = jnp.concatenate([T_sb, S_b, Pj], axis=1)
         else:
             A = jnp.concatenate([T_sb, Pj], axis=1)
@@ -530,11 +574,12 @@ def fit_rv(
     sig_nat_star_j, sig_nat_tell_j = jnp.asarray(sig_nat_star), jnp.asarray(sig_nat_tell)
     eps_j = jnp.asarray(float(epsilon))
 
-    def _refine(x0, fit_R, fit_vs, sig_obs_fix, vsini_fix):
+    def _refine(x0, fit_R, fit_vs, sig_obs_fix, vsini_fix, fit_t):
         x_star, H = _newton_jit(
             jnp.asarray(x0), Tf, Sf, Pj, Wj, lndj, freq, j_off, const_j, ridge_j,
             sig_nat_star_j, sig_nat_tell_j, jnp.asarray(float(sig_obs_fix)),
-            jnp.asarray(float(vsini_fix)), eps_j, n=n, fit_R=fit_R, fit_vsini=fit_vs)
+            jnp.asarray(float(vsini_fix)), eps_j, n=n, fit_R=fit_R, fit_vsini=fit_vs,
+            fit_tell=fit_t)
         return np.asarray(x_star), np.asarray(H)
 
     # --- coarse scan over the active broadening params + RV lags ---------------
@@ -594,9 +639,15 @@ def fit_rv(
         x0.append(float(sp_vals[i_sp]))
     if refine_vs:
         x0.append(float(vs_vals[i_vs]))
+    # the telluric lag (wavelength zero-point) is small, so we add it to the
+    # refinement initialised at 0 (the value it held in the coarse fixed block)
+    # and let Newton move it jointly -- no coarse grid dimension for it.
+    if fit_tell:
+        x0.append(0.0)
     sig_obs_fix_use = sig_obs_fixed if not refine_R else 0.0
     vsini_fix_use = vsini_fixed if not refine_vs else 0.0
-    x_star, H = _refine(x0, refine_R, refine_vs, sig_obs_fix_use, vsini_fix_use)
+    x_star, H = _refine(x0, refine_R, refine_vs, sig_obs_fix_use, vsini_fix_use,
+                        fit_tell)
 
     # --- unpack the refined nonlinear params -----------------------------------
     p_star = float(x_star[0])
@@ -613,11 +664,15 @@ def fit_rv(
         vsp_star = 0.0
     else:
         vsp_star = vsini_fixed
+    if fit_tell:
+        p_tell_star = float(x_star[idx]); tell_col = idx; idx += 1
+    else:
+        p_tell_star = 0.0; tell_col = None
 
     # --- exact final solve at the optimum --------------------------------------
     dx_star = p_star * dln
     v_star = C_LIGHT_KMS * np.expm1(dx_star)
-    chi2_exact, theta, cov, A = _exact_at(p_star, sp_star, vsp_star)
+    chi2_exact, theta, cov, A = _exact_at(p_star, sp_star, vsp_star, p_tell_star)
     theta = np.asarray(theta)
     w = theta[:Ktot]
     u = theta[Ktot:Ktot + J_tell]
@@ -628,15 +683,20 @@ def fit_rv(
     # fit), not just the ones actually refined -- a search costs a degree of
     # freedom even when its optimum lands on a bound (lower limit). This matches
     # the previous single-broadening convention (n_nonlin = 2 when fit_resolution).
-    n_nonlin = 1 + int(fit_resolution) + int(fit_vsini)
+    n_nonlin = 1 + int(fit_resolution) + int(fit_vsini) + int(fit_tell)
     dof = n_good - D - n_nonlin
 
     # --- covariance of the active nonlinear params (Delta-chi2 = 1) ------------
-    # H is over x_star = [p (, sigma_obs_pix) (, vsini_pix)]; invert to get cov.
+    # H is over x_star = [p (, sigma_obs_pix) (, vsini_pix) (, p_tell)]; invert to
+    # get cov. The objective is EVEN in each broadening param (R, vsini) -- we
+    # report their abs() -- so we flip the cross-term sign when one was refined to
+    # the negative branch. The telluric lag p_tell is NOT even (it is a genuine
+    # signed shift like p), so it is excluded from the sign-fix.
     if np.all(np.linalg.eigvalsh(H) > 0):
         cov_x = 2.0 * np.linalg.inv(H)
-        # objective is even in each broadening param -> keep cross-term signs sane
         for k in range(1, x_star.size):
+            if k == tell_col:
+                continue
             if x_star[k] < 0:
                 cov_x[0, k] = -cov_x[0, k]; cov_x[k, 0] = -cov_x[k, 0]
     else:
@@ -690,6 +750,38 @@ def fit_rv(
 
     if use_tell:
         out["u"] = u
+
+    if fit_tell:
+        # Telluric lag p_tell = the instrument wavelength zero-point (tellurics are
+        # at rest in the observer frame). Report it as a velocity, and report the
+        # stellar RV with that zero-point removed via the LAG DIFFERENCE so the
+        # shared zero-point cancels: v_corr = c * expm1((p_star - p_tell) * dln).
+        # Errors propagate from the joint (p_star, p_tell) 2x2 sub-block of cov_x.
+        dx_tell = p_tell_star * dln
+        v_tell = C_LIGHT_KMS * np.expm1(dx_tell)
+        dvt_dpt = C_LIGHT_KMS * np.exp(dx_tell) * dln
+        var_pt = cov_x[tell_col, tell_col]
+        v_tell_err = (np.sqrt(var_pt) * abs(dvt_dpt)
+                      if np.isfinite(var_pt) and var_pt >= 0 else np.nan)
+
+        q = p_star - p_tell_star
+        dxq = q * dln
+        v_corr = C_LIGHT_KMS * np.expm1(dxq)
+        dvc_dp = C_LIGHT_KMS * np.exp(dxq) * dln       # d v_corr / d p_star
+        # d v_corr / d p_tell = -dvc_dp; propagate through the joint 2x2 cov.
+        cov_pp = np.array([[cov_x[0, 0], cov_x[0, tell_col]],
+                           [cov_x[tell_col, 0], cov_x[tell_col, tell_col]]])
+        g = np.array([dvc_dp, -dvc_dp])
+        var_corr = float(g @ cov_pp @ g)
+        v_corr_err = np.sqrt(var_corr) if np.isfinite(var_corr) and var_corr >= 0 else np.nan
+
+        out.update({
+            "v_tell_kms": float(v_tell),
+            "v_tell_err_kms": float(v_tell_err),
+            "v_corr_kms": float(v_corr),
+            "v_corr_err_kms": float(v_corr_err),
+            "p_tell_star": float(p_tell_star),
+        })
 
     if fit_resolution:
         # back-compat single-R reporting (cov_vR is the 2x2 (v,R) block).
