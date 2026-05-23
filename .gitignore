@@ -13,6 +13,7 @@ dist/
 # large data + generated artifacts (regenerate with the scripts / CLI)
 grid/original/
 grid/convolved/
+grid/telluric/
 outputs/*.npz
 docs/*.aux
 docs/*.log
