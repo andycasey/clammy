@@ -350,6 +350,7 @@ def fit_rv(
     epsilon=0.6,
     return_model=True,
     rescale_errors=False,
+    n_conv_iter=0,
 ):
     """Fit radial velocity (+ optional resolution, vsini, tellurics), weights, continuum.
 
@@ -398,6 +399,53 @@ def fit_rv(
     vsini_bounds, n_vsini : vsini coarse-grid range/size when `fit_vsini`.
     epsilon : float            linear limb-darkening coefficient for the Gray
                                rotation profile (default 0.6).
+
+    n_conv_iter : int          OPTIONAL. Iterations of the linear-flux convolution
+                               correction (default 0 -> OFF, byte-identical to the
+                               historical log-space-broadened fit). See the
+                               "Iterated linear-flux convolution correction" note
+                               below. With n_conv_iter >= 1 the model is broadened
+                               in LINEAR flux (the physically correct space for the
+                               instrument LSF), which removes the deep-core misfit
+                               and the ~few-percent R bias of the log-space
+                               approximation.
+
+    Iterated linear-flux convolution correction (``n_conv_iter``)
+    -------------------------------------------------------------
+    The inner solve is linear in (w, u, c) only because we broaden the LOG-rectified
+    basis -- a Fourier multiply on ``ln``-flux. The instrument LSF, however,
+    physically convolves the LINEAR flux. Writing the per-component log-model as the
+    log-space-broadened block
+
+        A_c = G_c (x)_log m_c        (Fourier multiply of the transfer G_c on ln-flux)
+
+    where ``m_c`` is the UNBROADENED (RV/lag-shifted) component log-flux, the EXACT
+    (linear-flux-broadened) block is
+
+        E_c = ln( G_c (x) exp(m_c) )  (convolve the LINEAR flux, then take the log).
+
+    The two agree to first order; the dropped second-order term ``delta_c = E_c - A_c``
+    is the ``+1/2 Var_LSF`` curvature term and peaks sharply at deep, saturated line
+    cores (where it reaches many sigma). Continuum is smooth, so it needs no
+    correction; ``delta = delta_star + delta_tell``.
+
+    Because ``E = A + delta``, fitting the existing log-space machinery to the
+    CORRECTED data ``lnd_eff = lnd - delta`` makes the exact model ``E`` match the
+    data. We iterate a fixed point:
+
+      iter 0 : lnd_eff = lnd (delta = 0) -> the historical fit (coarse scan + Newton
+               + exact solve) gives the nonlinear params and theta = (w, u, c).
+      iter k : recompute delta from the current solution (the small correction does
+               not move the basin), set lnd_eff = lnd - delta, WARM-START the Newton
+               from the previous optimum (SKIP the coarse scan), re-solve exactly,
+               recompute delta. Stop after ``n_conv_iter`` iters (or earlier if delta
+               stops changing). Each extra iter costs a warm Newton refine + a couple
+               of FFTs -- no new coarse scan.
+
+    After convergence the EXACT model ``exp(E) = exp(A + delta)`` is reported, ``R``
+    is fit against the corrected data (so its log-space bias vanishes), and the
+    block decomposition (``ln_star``/``ln_tell``/``ln_cont``) holds the EXACT
+    broadened blocks ``E_star``/``E_tell``/``cont`` so it still sums to ``ln_model``.
 
     Modes
     -----
@@ -550,12 +598,15 @@ def fit_rv(
         MTF = jnp.stack(cols, axis=-1)
         return np.asarray(_quad_forms(MTF, bT, M_TT0, M_FF, b_F, float(ridge)))
 
-    def _exact_at(p, sigma_obs_pix, vsini_pix, p_tell=0.0):
+    def _exact_at(p, sigma_obs_pix, vsini_pix, p_tell=0.0, lnd_arg=lndj):
         """Exact profiled solve at sub-pixel shift p and given broadening.
 
         When the telluric block is active it is broadened and (if a telluric lag
         ``p_tell`` is supplied) shifted by ``exp(-2 pi i freq p_tell)`` -- matching
-        the shift the profiled chi2 / Newton refine applies.
+        the shift the profiled chi2 / Newton refine applies. ``lnd_arg`` defaults to
+        the raw data; the linear-flux convolution loop passes ``lnd_eff = lnd -
+        delta`` so the exact solve (and its chi2) are taken against the corrected
+        log-data.
         """
         gT = star_tf(sigma_obs_pix, vsini_pix)
         phase = jnp.exp(-2j * np.pi * freq * float(p))
@@ -569,8 +620,78 @@ def fit_rv(
             A = jnp.concatenate([T_sb, S_b, Pj], axis=1)
         else:
             A = jnp.concatenate([T_sb, Pj], axis=1)
-        theta, cov, chi2 = _solve_exact(A, Wj, lndj, float(ridge))
+        theta, cov, chi2 = _solve_exact(A, Wj, lnd_arg, float(ridge))
         return float(chi2), theta, cov, A
+
+    def _delta(theta, p, sigma_obs_pix, vsini_pix, p_tell=0.0):
+        """Per-component linear-flux convolution correction delta = E - A.
+
+        For each broadened component c, ``A_c = G_c (x)_log m_c`` is the LOG-space
+        broadened block the design already uses, and ``E_c = ln(G_c (x) exp(m_c))``
+        is the EXACT block obtained by convolving the LINEAR flux. With the SAME
+        transfer functions the fitter builds (``star_tf`` = instrument differential
+        Gaussian * rotation; ``tell_tf`` = instrument differential Gaussian), at the
+        current nonlinear params, the correction is
+
+            delta_c = E_c - A_c   (the dropped +1/2 Var_LSF curvature term).
+
+        ``m_star`` is the UNBROADENED, RV-shifted stellar log-flux (= the stellar
+        columns shifted by the RV phase, NO broadening multiply, weighted by w);
+        ``m_tell`` is the UNBROADENED, lag-shifted telluric log-flux (weighted by u).
+        The continuum is smooth -> no correction. Returns ``(delta_star, delta_tell,
+        E_star, E_tell)`` (eager numpy), where ``E_c = A_c + delta_c`` are the EXACT
+        broadened blocks used for the reported decomposition.
+
+        Masked-region guard: the correction is only used at GOOD pixels (the masked
+        edges/gaps are W = 0). A resampled basis can extrapolate to enormous log-flux
+        there (e.g. m_tell ~ +100 -> exp ~ 1e46), and convolving such a spike rings
+        the circular FFT into NEGATIVE linear flux -> log(neg) = NaN that would poison
+        the warm Newton. So we exponentiate from the log-flux with the masked region
+        set to the continuum level (m_c = 0 -> linear flux 1, the neutral "no
+        absorption" value), floor the convolved linear flux to a tiny positive value
+        before the log (as the toy generator does), and zero ``delta`` outside the
+        good region. The instrument Gaussian is only a few pixels wide -- far narrower
+        than the masked edge band -- so this leaves the correction at good pixels
+        physically intact.
+        """
+        theta = jnp.asarray(theta)
+        w_ = theta[:Ktot]
+        u_ = theta[Ktot:Ktot + J_tell]
+        phase = jnp.exp(-2j * np.pi * freq * float(p))
+        goodj = jnp.asarray(good)
+        FLOOR = 1e-300                  # linear-flux floor before the log (toy-style)
+
+        # --- stellar block -----------------------------------------------------
+        gT = star_tf(sigma_obs_pix, vsini_pix)
+        # unbroadened, RV-shifted stellar log-flux m_star(x) = sum_k w_k T_k(x - dx)
+        m_star = jnp.fft.irfft((Tf * phase[:, None]) @ w_, n=n)
+        # log-space broadened block A_star = G_star (x)_log m_star, applied to the
+        # SAME shifted-weighted combination (matches the design's stellar columns).
+        A_star = jnp.fft.irfft((Tf * gT[:, None] * phase[:, None]) @ w_, n=n)
+        # exact (linear-flux) broadened block E_star = ln(G_star (x) exp(m_star)),
+        # with the masked region forced to continuum (m=0) so edge spikes cannot ring.
+        es = jnp.exp(jnp.where(goodj, m_star, 0.0))
+        E_star_raw = jnp.log(jnp.maximum(jnp.fft.irfft(jnp.fft.rfft(es) * gT, n=n), FLOOR))
+        delta_star = np.where(good, np.asarray(E_star_raw - A_star), 0.0)
+        # report E_star = A_star + delta_star so the block decomposition sums EXACTLY
+        # to ln_model = A@theta + delta everywhere (incl. the delta=0 masked region).
+        E_star = np.asarray(A_star) + delta_star
+
+        # --- telluric block (instrument broadening only, no rotation) ----------
+        if J_tell:
+            tell_phase = (jnp.exp(-2j * np.pi * freq * float(p_tell))
+                          if p_tell else jnp.ones_like(freq))
+            gS = tell_tf(sigma_obs_pix)
+            m_tell = jnp.fft.irfft((Sf * tell_phase[:, None]) @ u_, n=n)
+            A_tell = jnp.fft.irfft((Sf * gS[:, None] * tell_phase[:, None]) @ u_, n=n)
+            et = jnp.exp(jnp.where(goodj, m_tell, 0.0))
+            E_tell_raw = jnp.log(jnp.maximum(jnp.fft.irfft(jnp.fft.rfft(et) * gS, n=n), FLOOR))
+            delta_tell = np.where(good, np.asarray(E_tell_raw - A_tell), 0.0)
+            E_tell = np.asarray(A_tell) + delta_tell
+        else:
+            delta_tell = np.zeros(n)
+            E_tell = np.zeros(n)
+        return delta_star, delta_tell, E_star, E_tell
 
     # --- decide the nonlinear-parameter layout ---------------------------------
     # sigma_obs_pix: fit / fixed / off(0); vsini_pix: fit / fixed / off(0).
@@ -581,9 +702,13 @@ def fit_rv(
     sig_nat_star_j, sig_nat_tell_j = jnp.asarray(sig_nat_star), jnp.asarray(sig_nat_tell)
     eps_j = jnp.asarray(float(epsilon))
 
-    def _refine(x0, fit_R, fit_vs, sig_obs_fix, vsini_fix, fit_t):
+    def _refine(x0, fit_R, fit_vs, sig_obs_fix, vsini_fix, fit_t,
+                lnd_arg=lndj, const_arg=const_j):
         # box bounds matching the x0 layout [p (, sigma_obs)(, vsini)(, p_tell)].
         # R in [RMIN, RMAX] <-> sigma_obs in [sigpix(RMAX), sigpix(RMIN)].
+        # ``lnd_arg``/``const_arg`` default to the raw data; the linear-flux
+        # convolution loop passes the corrected ``lnd_eff`` (and its const) here so
+        # the Newton refine fits the corrected data (a warm restart from x0).
         lo, hi = [-np.inf], [np.inf]
         if fit_R:
             lo.append(float(sigpix_of_R(R_bounds[1])))
@@ -596,7 +721,7 @@ def fit_rv(
             hi.append(np.inf)
         x_star, H = _newton_jit(
             jnp.asarray(x0), jnp.asarray(lo), jnp.asarray(hi),
-            Tf, Sf, Pj, Wj, lndj, freq, j_off, const_j, ridge_j,
+            Tf, Sf, Pj, Wj, lnd_arg, freq, j_off, const_arg, ridge_j,
             sig_nat_star_j, sig_nat_tell_j, jnp.asarray(float(sig_obs_fix)),
             jnp.asarray(float(vsini_fix)), eps_j, n=n, fit_R=fit_R, fit_vsini=fit_vs,
             fit_tell=fit_t)
@@ -689,11 +814,74 @@ def fit_rv(
     else:
         p_tell_star = 0.0; tell_col = None
 
-    # --- exact final solve at the optimum --------------------------------------
-    dx_star = p_star * dln
-    v_star = C_LIGHT_KMS * np.expm1(dx_star)
+    # --- exact final solve at the optimum (iter 0; delta = 0) ------------------
     chi2_exact, theta, cov, A = _exact_at(p_star, sp_star, vsp_star, p_tell_star)
     theta = np.asarray(theta)
+
+    # --- iterated linear-flux convolution correction ---------------------------
+    # iter 0 above used lnd_eff = lnd (delta = 0) -> byte-identical to the historical
+    # fit. When n_conv_iter >= 1 we fit the EXACT (linear-flux-broadened) model by
+    # the fixed point: correct the data lnd_eff = lnd - delta (delta = E - A peaks at
+    # deep cores), WARM-START the Newton from the previous optimum (no coarse scan --
+    # the small correction does not move the basin), re-solve exactly, recompute
+    # delta. Stop after n_conv_iter iters or when delta stops changing.
+    delta_star = delta_tell = None        # block corrections (None until computed)
+    E_star_block = E_tell_block = None     # exact broadened blocks for reporting
+    if n_conv_iter >= 1:
+        x_prev = np.asarray(x_star, float)
+        for _it in range(int(n_conv_iter)):
+            # delta from the CURRENT solution (its nonlinear params + theta).
+            dstar, dtell, E_star_block, E_tell_block = _delta(
+                theta, p_star, sp_star, vsp_star, p_tell_star)
+            delta = dstar + dtell                  # continuum needs no correction
+            delta_prev = delta_star + delta_tell if delta_star is not None else None
+            delta_star, delta_tell = dstar, dtell
+
+            # corrected log-data and its lnd-dependent normal-equation pieces.
+            lnd_eff = np.where(good, lnd - delta, 0.0)
+            lnd_eff_j = jnp.asarray(lnd_eff)
+            const_eff_j = jnp.sum(Wj * lnd_eff_j * lnd_eff_j)
+
+            # warm refine (Newton from x_prev, NO coarse scan) on the corrected data,
+            # then the exact profiled solve on the corrected data.
+            x_star, H = _refine(x_prev, refine_R, refine_vs, sig_obs_fix_use,
+                                vsini_fix_use, fit_tell,
+                                lnd_arg=lnd_eff_j, const_arg=const_eff_j)
+            p_star = float(x_star[0])
+            jj = 1
+            if refine_R:
+                sp_star = abs(float(x_star[jj])); jj += 1
+            if refine_vs:
+                vsp_star = abs(float(x_star[jj])); jj += 1
+            if fit_tell:
+                p_tell_star = float(x_star[jj]); jj += 1
+            # chi2_exact = sum W (lnd_eff - A)^2 = sum W (lnd - A - delta)^2 -- the
+            # EXACT-model chi2, since lnd_eff - A = lnd - (A + delta) = lnd - E.
+            chi2_exact, theta, cov, A = _exact_at(
+                p_star, sp_star, vsp_star, p_tell_star, lnd_arg=lnd_eff_j)
+            theta = np.asarray(theta)
+            x_prev = np.asarray(x_star, float)
+
+            # early stop if delta has effectively converged.
+            if delta_prev is not None:
+                dchg = float(np.max(np.abs((delta_star + delta_tell) - delta_prev)))
+                if dchg < 1e-8:
+                    break
+        # recompute the FINAL delta / exact blocks at the converged solution so the
+        # reported model (exp(A + delta)) and block decomposition are consistent
+        # with the params we report. (The chi2 from the last in-loop solve used the
+        # PRE-refine delta; the refine then moved theta/params, so we recompute the
+        # exact-model chi2 = sum W (lnd - A@theta - delta_final)^2 against the FINAL
+        # delta so chi2 and the reported model E = A@theta + delta agree exactly.)
+        delta_star, delta_tell, E_star_block, E_tell_block = _delta(
+            theta, p_star, sp_star, vsp_star, p_tell_star)
+        A_np_final = np.asarray(A)
+        ln_model_final = A_np_final @ theta + (delta_star + delta_tell)
+        chi2_exact = float(np.sum(np.asarray(W) * np.where(
+            good, lnd - ln_model_final, 0.0) ** 2))
+
+    dx_star = p_star * dln
+    v_star = C_LIGHT_KMS * np.expm1(dx_star)
     w = theta[:Ktot]
     u = theta[Ktot:Ktot + J_tell]
     c = theta[Ktot + J_tell:]
@@ -873,16 +1061,36 @@ def fit_rv(
 
     if return_model:
         A_np = np.asarray(A)
-        ln_model = A_np @ theta
-        out["ln_model"] = ln_model
-        out["model"] = np.exp(ln_model)
-        out["lnd"] = lnd
-        out["resid_lnd"] = np.where(good, lnd - ln_model, np.nan)
-        out["good"] = good
-        # decompose the additive log-model into its blocks (shifted/broadened):
-        # stellar absorption, telluric absorption, and the Legendre continuum.
-        out["ln_star"] = A_np[:, :Ktot] @ theta[:Ktot]
-        out["ln_cont"] = A_np[:, Ktot + J_tell:] @ theta[Ktot + J_tell:]
-        if J_tell:
-            out["ln_tell"] = A_np[:, Ktot:Ktot + J_tell] @ theta[Ktot:Ktot + J_tell]
+        if delta_star is None:
+            # n_conv_iter = 0: the historical log-space-broadened model (unchanged).
+            ln_model = A_np @ theta
+            out["ln_model"] = ln_model
+            out["model"] = np.exp(ln_model)
+            out["lnd"] = lnd
+            out["resid_lnd"] = np.where(good, lnd - ln_model, np.nan)
+            out["good"] = good
+            # decompose the additive log-model into its blocks (shifted/broadened):
+            # stellar absorption, telluric absorption, and the Legendre continuum.
+            out["ln_star"] = A_np[:, :Ktot] @ theta[:Ktot]
+            out["ln_cont"] = A_np[:, Ktot + J_tell:] @ theta[Ktot + J_tell:]
+            if J_tell:
+                out["ln_tell"] = A_np[:, Ktot:Ktot + J_tell] @ theta[Ktot:Ktot + J_tell]
+        else:
+            # n_conv_iter >= 1: report the EXACT (linear-flux-broadened) model
+            # E = A + delta. ln_model = A@theta + delta; model = exp(E); the fit
+            # residual is lnd - E = lnd_eff - A (the residual on the corrected data).
+            delta = delta_star + delta_tell
+            ln_model = A_np @ theta + delta
+            out["ln_model"] = ln_model
+            out["model"] = np.exp(ln_model)
+            out["lnd"] = lnd
+            out["resid_lnd"] = np.where(good, lnd - ln_model, np.nan)
+            out["good"] = good
+            # block decomposition uses the EXACT broadened blocks so it still sums
+            # to ln_model: ln_star = E_star = A_star + delta_star, ln_tell = E_tell,
+            # ln_cont = cont (smooth -> uncorrected).
+            out["ln_star"] = E_star_block
+            out["ln_cont"] = A_np[:, Ktot + J_tell:] @ theta[Ktot + J_tell:]
+            if J_tell:
+                out["ln_tell"] = E_tell_block
     return out

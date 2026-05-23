@@ -355,6 +355,7 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         vsini_bounds=tuple(args.vsini_bounds),
         epsilon=args.epsilon,
         rescale_errors=args.rescale_errors,
+        n_conv_iter=args.conv_iter,
     )
     res = fitter.fit_rv(flux, sigma, loglam_b, mu, Phi, **fit_kwargs)
     if args.rescale_errors:
@@ -782,6 +783,9 @@ def build_parser():
                     "automatically from the FITS header (RA/Dec/MJD/site) when possible")
     pf.add_argument("--rescale-errors", action="store_true",
                     help="rescale the formal RV errors by sqrt(chi2/dof) (reduced chi2 -> 1)")
+    pf.add_argument("--conv-iter", type=int, default=0, metavar="N",
+                    help="iterate the EXACT linear-flux convolution N times to fix deep line "
+                    "cores (0=off, fast log-space approx; ~8-12 converges). Unbiases R.")
     pf.set_defaults(func=cmd_fit)
 
     return p
