@@ -15,109 +15,121 @@ RV+weights and its convexity → continuum → convolution/R) is in
 
 ## Principle
 
-Resample to a uniform log-wavelength grid $x = \ln\lambda$, so a radial
-velocity $v$ acts as a pure translation $T_k(x) \to T_k(x - \Delta x)$ with
-$\Delta x = \ln(1 + v/c)$. Working in log-flux makes the
-(continuum $\times$ rectified-flux) model additive:
+Resample to a uniform log-wavelength grid $`x = \ln\lambda`$, so a radial
+velocity $`v`$ acts as a pure translation $`T_k(x) \to T_k(x - \Delta x)`$ with
+$`\Delta x = \ln(1 + v/c)`$. Working in log-flux makes the
+(continuum $`\times`$ rectified-flux) model additive:
 
-$$\ln d(x) \;\approx\; \underbrace{\sum_{k=0}^{K} w_k\,T_k(x - \Delta x)}_{\text{rectified line basis}} \;+\; \underbrace{\sum_{m=0}^{L} c_m\,P_m(x)}_{\text{log-continuum}}$$
+```math
+\ln d(x)  \approx  \underbrace{\sum_{k=0}^{K} w_k T_k(x - \Delta x)}_{\text{rectified line basis}}  +  \underbrace{\sum_{m=0}^{L} c_m P_m(x)}_{\text{log-continuum}}
+```
 
-The templates $\mathbf{T} = [\mu,\,\phi_1,\,\dots,\,\phi_K]$ are the basis of the
-*rectified* model grid (e.g. a mean $\mu \equiv T_0$ and PCA components
-$\phi_k \equiv T_k$); $P_m$ are Legendre polynomials. At fixed $\Delta x$ the model
-is linear in $\boldsymbol\theta = (\mathbf{w}, \mathbf{c})$, so we solve linearly
-inside, scan $\Delta x$ outside. With the design
-$\mathbf{A}(\Delta x) = [\,\mathbf{T}(\Delta x) \mid \mathbf{P}\,]$ and weights
-$\mathbf{W} = \mathrm{diag}(W_i)$ on $\ln d$ ($W_i = (d_i/\sigma_i)^2$;
-masked px $\to W_i = 0$):
+The templates $`\mathbf{T} = [\mu, \phi_1, \dots, \phi_K]`$ are the basis of the
+*rectified* model grid (e.g. a mean $`\mu \equiv T_0`$ and PCA components
+$`\phi_k \equiv T_k`$); $`P_m`$ are Legendre polynomials. At fixed $`\Delta x`$ the model
+is linear in $`\boldsymbol\theta = (\mathbf{w}, \mathbf{c})`$, so we solve linearly
+inside, scan $`\Delta x`$ outside. With the design
+$`\mathbf{A}(\Delta x) = [ \mathbf{T}(\Delta x) \mid \mathbf{P} ]`$ and weights
+$`\mathbf{W} = \mathrm{diag}(W_i)`$ on $`\ln d`$ ($`W_i = (d_i/\sigma_i)^2`$;
+masked px $`\to W_i = 0`$):
 
-$$\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix} \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\,\ln d$$
+```math
+\mathbf{N}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W}\mathbf{A} = \begin{bmatrix} \mathbf{M}_{TT} & \mathbf{M}_{TP} \\ \mathbf{M}_{TP}^{\mathsf{T}} & \mathbf{M}_{PP} \end{bmatrix} \qquad \mathbf{r}(\Delta x) = \mathbf{A}^{\mathsf{T}}\mathbf{W} \ln d
+```
 
-$$\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r} \qquad \chi^2(\Delta x) = \|\ln d\|^2_{\mathbf{W}} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}$$
+```math
+\widehat{\boldsymbol\theta}(\Delta x) = \mathbf{N}^{-1}\mathbf{r} \qquad \chi^2(\Delta x) = \|\ln d\|^2_{\mathbf{W}} - \mathbf{r}^{\mathsf{T}}\mathbf{N}^{-1}\mathbf{r}
+```
 
-This $\mathbf{W}$ is the inverse-variance weight of $\ln d$
-($\sigma_{\ln d} \approx \sigma_d/d$; masked px get weight $0$), playing the role
-of $\Sigma^{-1}$. The radial-velocity estimate is the global minimiser
-$\widehat{\Delta x} = \arg\min_{\Delta x} \chi^2(\Delta x)$, with
-$\widehat v = c\,(e^{\widehat{\Delta x}} - 1)$.
+This $`\mathbf{W}`$ is the inverse-variance weight of $`\ln d`$
+($`\sigma_{\ln d} \approx \sigma_d/d`$; masked px get weight $`0`$), playing the role
+of $`\Sigma^{-1}`$. The radial-velocity estimate is the global minimiser
+$`\widehat{\Delta x} = \arg\min_{\Delta x} \chi^2(\Delta x)`$, with
+$`\widehat v = c (e^{\widehat{\Delta x}} - 1)`$.
 
-**Speed**: both $\mathbf{b}_T(\Delta x)$ and $\mathbf{M}_{TP}(\Delta x)$ are
+**Speed**: both $`\mathbf{b}_T(\Delta x)`$ and $`\mathbf{M}_{TP}(\Delta x)`$ are
 cross-correlations of fixed vectors against a shifted template → computed for all
-shifts at once via FFT. $\mathbf{M}_{PP}$, $\mathbf{b}_P$ are shift-independent;
-$\mathbf{M}_{TT}$ is only weakly shift-dependent (through the weights) so
-$\mathbf{M}_{TT}(0)$ is used during the coarse scan, then $\mathbf{M}_{TT}$ is
+shifts at once via FFT. $`\mathbf{M}_{PP}`$, $`\mathbf{b}_P`$ are shift-independent;
+$`\mathbf{M}_{TT}`$ is only weakly shift-dependent (through the weights) so
+$`\mathbf{M}_{TT}(0)`$ is used during the coarse scan, then $`\mathbf{M}_{TT}`$ is
 recomputed exactly at the refined shift. Circular-FFT wrap is eliminated by zeroing
 the data weights in a band of width = max lag at each edge, making the circular
 correlation equal to the linear one over the valid region.
 
-**Resolution / convolution**: at constant resolving power $R$ the LSF is a Gaussian
+**Resolution / convolution**: at constant resolving power $`R`$ the LSF is a Gaussian
 of constant width *in velocity* → constant pixels on the log grid → one Fourier
-multiply $\widehat T_k(\omega) \to \widehat T_k(\omega)\,\exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)$,
-with $\sigma_{\rm pix} = c/(f\,\mathrm{velscale}\,R)$, where $\mathrm{velscale} = c\,\delta$
-is the velocity per pixel and $f = 2\sqrt{2\ln 2}$. It can be fixed (known LSF,
-pre-broaden once) or fit jointly with $v$ (`fit_resolution=True`) as a second
-nonlinear parameter — the model stays linear in $(\mathbf{w}, \mathbf{c})$ at fixed
-$(\Delta x, R)$. Caveat: the LSF convolves *linear* flux, but to keep the inner
+multiply $`\widehat T_k(\omega) \to \widehat T_k(\omega) \exp(-2\pi^2\omega^2\sigma_{\rm pix}^2)`$,
+with $`\sigma_{\rm pix} = c/(f \mathrm{velscale} R)`$, where $`\mathrm{velscale} = c \delta`$
+is the velocity per pixel and $`f = 2\sqrt{2\ln 2}`$. It can be fixed (known LSF,
+pre-broaden once) or fit jointly with $`v`$ (`fit_resolution=True`) as a second
+nonlinear parameter — the model stays linear in $`(\mathbf{w}, \mathbf{c})`$ at fixed
+$`(\Delta x, R)`$. Caveat: the LSF convolves *linear* flux, but to keep the inner
 solve linear we broaden the *log*-rectified templates; this matches the exact
 linear-flux convolution to first order and slightly over-deepens saturated cores
 (the toy uses the exact linear-flux convolution, so the validation measures the
-residual ~2% $R$ bias). For wavelength-dependent $R$/non-Gaussian LSFs, precompute
-banded convolution matrices on an $R$-grid and interpolate.
+residual ~2% $`R`$ bias). For wavelength-dependent $`R`$/non-Gaussian LSFs, precompute
+banded convolution matrices on an $`R`$-grid and interpolate.
 
 ### Extended forward model: tellurics, rotation, and native resolution
 
 The same separable structure absorbs three further nuisances. The full log-flux
 forward model is
 
-$$\ln d(x) \approx \underbrace{G_{\rm rot}(v\sin i)\,G_{\rm inst}}_{\text{stellar}} \sum_{k=0}^{K} w_k\,T_k(x - \Delta x) \;+\; \underbrace{G_{\rm inst}}_{\text{telluric}} \sum_{j=0}^{J} u_j\,S_j(x) \;+\; \sum_{m=0}^{L} c_m\,P_m(x)$$
+```math
+\ln d(x) \approx \underbrace{G_{\rm rot}(v\sin i) G_{\rm inst}}_{\text{stellar}} \sum_{k=0}^{K} w_k T_k(x - \Delta x)  +  \underbrace{G_{\rm inst}}_{\text{telluric}} \sum_{j=0}^{J} u_j S_j(x)  +  \sum_{m=0}^{L} c_m P_m(x)
+```
 
-with $G_{\rm inst}$ the instrument LSF and $G_{\rm rot}(v\sin i)$ the rotation
+with $`G_{\rm inst}`$ the instrument LSF and $`G_{\rm rot}(v\sin i)`$ the rotation
 kernel (both Fourier multiplies).
 
-- **Tellurics.** Earth's atmosphere imprints absorption at *fixed observed
-  wavelengths*, independent of the star's motion. So the telluric templates
-  $S_j = [\mathrm{tell}\,\mu,\,\mathrm{tell}\,\phi_1,\dots]$ live in the observed
-  (topocentric) frame and are not RV-shifted — they enter as shift-independent
-  columns alongside the Legendre continuum $P_m$, broadened by the instrument LSF
-  only. They contribute telluric weights $\mathbf{u}$ to
-  $\boldsymbol\theta = (\mathbf{w}, \mathbf{u}, \mathbf{c})$. The fixed block is
-  generalised from $\mathbf{P}$ to $\mathbf{F} = [\,G_{\rm inst}\mathbf{S} \mid \mathbf{P}\,]$,
-  so $\mathbf{M}_{FF}, \mathbf{b}_F$ change only when the telluric broadening
-  changes; when no telluric basis is supplied, $\mathbf{F} = \mathbf{P}$ and every
-  code path reduces to the stellar-only case.
+**Tellurics.** Earth's atmosphere imprints absorption at *fixed observed
+wavelengths*, independent of the star's motion. So the telluric templates
+$`S_j = [\mathrm{tell} \mu, \mathrm{tell} \phi_1,\dots]`$ live in the observed
+(topocentric) frame and are not RV-shifted — they enter as shift-independent
+columns alongside the Legendre continuum $`P_m`$, broadened by the instrument LSF
+only. They contribute telluric weights $`\mathbf{u}`$ to
+$`\boldsymbol\theta = (\mathbf{w}, \mathbf{u}, \mathbf{c})`$. The fixed block is
+generalised from $`\mathbf{P}`$ to $`\mathbf{F} = [ G_{\rm inst}\mathbf{S} \mid \mathbf{P} ]`$,
+so $`\mathbf{M}_{FF}, \mathbf{b}_F`$ change only when the telluric broadening
+changes; when no telluric basis is supplied, $`\mathbf{F} = \mathbf{P}`$ and every
+code path reduces to the stellar-only case.
 
-- **Rotation** ($v\sin i$). Stellar templates may additionally be convolved by a
-  Gray rotational profile of projected rotation velocity $v\sin i$ and linear
-  limb-darkening coefficient $\epsilon$ (default $0.6$),
+**Rotation** ($`v\sin i`$). Stellar templates may additionally be convolved by a
+Gray rotational profile of projected rotation velocity $`v\sin i`$ and linear
+limb-darkening coefficient $`\epsilon`$ (default $`0.6`$),
 
-  $$G(\Delta v) \;\propto\; 2\,(1-\epsilon)\sqrt{1-x^2} \;+\; \tfrac{\pi\epsilon}{2}\,(1-x^2) \qquad x = \Delta v / (v\sin i),\ |x| \le 1.$$
+```math
+G(\Delta v)  \propto  2 (1-\epsilon)\sqrt{1-x^2}  +  \tfrac{\pi\epsilon}{2} (1-x^2) \qquad x = \Delta v / (v\sin i),\ |x| \le 1.
+```
 
-  On the log grid this is a fixed-pixel kernel, rfft'd once into a real transfer
-  function that multiplies the stellar template FFTs — applied to the stellar block
-  only, never to tellurics or continuum. It can be fixed or fit (`fit_vsini=True`);
-  reported as `vsini_kms` ± err, with an unresolved lower-limit flag when the
-  optimum lands at the search floor.
+On the log grid this is a fixed-pixel kernel, rfft'd once into a real transfer
+function that multiplies the stellar template FFTs — applied to the stellar block
+only, never to tellurics or continuum. It can be fixed or fit (`fit_vsini=True`);
+reported as `vsini_kms` ± err, with an unresolved lower-limit flag when the
+optimum lands at the search floor.
 
-- **Native resolution.** Each basis records the native resolving power $R$ it was
-  built from. The fitter broadens differentially in quadrature, so a basis of
-  native dispersion $\sigma_{\rm native}$ is taken to the observed instrument
-  dispersion $\sigma_{\rm obs}$ via
+**Native resolution.** Each basis records the native resolving power $`R`$ it was
+built from. The fitter broadens differentially in quadrature, so a basis of
+native dispersion $`\sigma_{\rm native}`$ is taken to the observed instrument
+dispersion $`\sigma_{\rm obs}`$ via
 
-  $$\sigma_{\rm diff}^2 = \max\!\big(0,\; \sigma_{\rm obs}^2 - \sigma_{\rm native}^2\big).$$
+```math
+\sigma_{\rm diff}^2 = \max\big(0,  \sigma_{\rm obs}^2 - \sigma_{\rm native}^2\big).
+```
 
-  Stellar and telluric grids may be built at different native resolutions; each
-  carries its own, so the differential Gaussian applied to each block differs even
-  though the physical instrument resolution is a single shared parameter.
-  $R_{\rm native} = \infty$ (the default) gives $\sigma_{\rm native} = 0$ and
-  reproduces the full single-Gaussian broadening.
+Stellar and telluric grids may be built at different native resolutions; each
+carries its own, so the differential Gaussian applied to each block differs even
+though the physical instrument resolution is a single shared parameter.
+$`R_{\rm native} = \infty`$ (the default) gives $`\sigma_{\rm native} = 0`$ and
+reproduces the full single-Gaussian broadening.
 
-**Refinement / optimisation**: a coarse FFT scan over $\Delta x$ (and a coarse $R$
-grid) locates the global basin (the profiled $\chi^2$ is multimodal in the
-nonlinear parameters, though convex in $(\mathbf{w}, \mathbf{c})$ at fixed
-$(\Delta x, R)$); then a JAX-autodiff modified-Newton with a backtracking Armijo
-line search polishes $(\Delta x[, R])$ on the *profiled* $\chi^2$. The parameter
-covariance is the autodiff Hessian of the profiled $\chi^2$ at the optimum
-($\Delta\chi^2 = 1$), propagated to $(v, R)$. Typical warm cost ≈ 2 s/fit (CPU; the
+**Refinement / optimisation**: a coarse FFT scan over $`\Delta x`$ (and a coarse $`R`$
+grid) locates the global basin (the profiled $`\chi^2`$ is multimodal in the
+nonlinear parameters, though convex in $`(\mathbf{w}, \mathbf{c})`$ at fixed
+$`(\Delta x, R)`$); then a JAX-autodiff modified-Newton with a backtracking Armijo
+line search polishes $`(\Delta x[, R])`$ on the *profiled* $`\chi^2`$. The parameter
+covariance is the autodiff Hessian of the profiled $`\chi^2`$ at the optimum
+($`\Delta\chi^2 = 1`$), propagated to $`(v, R)`$. Typical warm cost ≈ 2 s/fit (CPU; the
 bottleneck is the 216k-point FFT, ~10× faster on GPU).
 
 ## Layout
@@ -198,7 +210,7 @@ clammy fit basis.npz spec.fits --fit-vsini                   # 4. vsini only (R 
    limb-darkening coefficient.
 
 Because each basis stores its native resolving power, the differential broadening
-$\sigma_{\rm diff}^2 = \max(0,\,\sigma_{\rm obs}^2 - \sigma_{\rm native}^2)$ is
+$`\sigma_{\rm diff}^2 = \max(0, \sigma_{\rm obs}^2 - \sigma_{\rm native}^2)`$ is
 correct even when the stellar and telluric grids were built at different
 resolutions.
 
@@ -322,7 +334,7 @@ res["u"]  # telluric template weights
 ```
 
 The fitter broadens each block differentially in quadrature,
-$\sigma_{\rm diff}^2 = \max(0,\,\sigma_{\rm obs}^2 - \sigma_{\rm native}^2)$, so
+$`\sigma_{\rm diff}^2 = \max(0, \sigma_{\rm obs}^2 - \sigma_{\rm native}^2)`$, so
 stellar and telluric grids built at different native resolutions are handled
 correctly; the default `np.inf` means "effectively unresolved" and reproduces full
 broadening.
