@@ -109,35 +109,72 @@ def _column(table, name):
     return np.asarray(table[name], float)
 
 
-def read_spectrum(path, wave_col, flux_col, sigma_col, snr, log_wave):
-    """Return (loglam, flux, sigma) for an observed spectrum.
+def vac_to_air(wave_vac):
+    """Vacuum -> air wavelengths (Angstrom), matching the dmost/PHOENIX template grid."""
+    w = np.asarray(wave_vac, float)
+    s2 = (1.0e4 / w) ** 2
+    n = 1.0 + 0.0000834254 + 0.02406147 / (130.0 - s2) + 0.00015998 / (38.9 - s2)
+    return w / n
 
-    Supports .npz (arrays keyed by the column names) and FITS tables. The
-    wavelength axis may be linear (Angstrom) or natural-log; it is auto-detected
-    (median > 50 -> linear) unless --log-wave/--linear-wave forces it.
+
+def read_spectrum(path, wave_col, flux_col, sigma_col, ivar_col, mask_col, snr,
+                  log_wave, wave_frame):
+    """Return (loglam, flux, sigma, good) for an observed spectrum.
+
+    Supports .npz (arrays keyed by name) and FITS tables (incl. the dmost single-row
+    array-cell layout and PypeIt ``OneSpec`` per-pixel tables). Uncertainties come
+    from ``sigma_col`` if present, else ``ivar_col`` (``sigma = 1/sqrt(ivar)``), else
+    ``--snr``. A 1=good ``mask_col`` is honoured (returned as ``good``; else None).
+    The wavelength axis is linear-A or natural-log (auto-detected: median > 50 ->
+    linear), and is converted vacuum->air to match the (air) template grid when
+    ``wave_frame='vacuum'`` -- or ``'auto'`` and the file looks like a PypeIt product
+    (e.g. a Keck/DEIMOS OneSpec spectrum, which stores vacuum wavelengths).
     """
+    meta = {}
     if path.endswith(".npz"):
         d = np.load(path)
-        wave = np.asarray(d[wave_col], float)
-        flux = np.asarray(d[flux_col], float)
-        sigma = np.asarray(d[sigma_col], float) if sigma_col in d.files else None
+        present = set(d.files)
+        col = lambda c: np.asarray(d[c], float)
     else:
         from astropy.table import Table
 
         t = Table.read(path)
-        wave = _column(t, wave_col)
-        flux = _column(t, flux_col)
-        sigma = _column(t, sigma_col) if sigma_col in t.colnames else None
+        meta = {str(k).upper(): t.meta[k] for k in t.meta}
+        present = set(t.colnames)
+        col = lambda c: _column(t, c)
+
+    wave = col(wave_col)
+    flux = col(flux_col)
+
+    if sigma_col in present:
+        sigma = col(sigma_col)
+    elif ivar_col in present:
+        iv = col(ivar_col)
+        sigma = np.where(iv > 0, 1.0 / np.sqrt(np.where(iv > 0, iv, 1.0)), np.inf)
+    elif snr is not None:
+        sigma = np.abs(flux) / float(snr)
+    else:
+        raise SystemExit(
+            f"no '{sigma_col}' or '{ivar_col}' column; pass --sigma-col/--ivar-col or --snr"
+        )
+
+    good = (np.asarray(col(mask_col), float) > 0) if mask_col in present else None
 
     if log_wave is None:
         log_wave = np.nanmedian(wave) < 50.0  # log axis is ~8-9; linear is thousands
-    loglam = wave if log_wave else np.log(wave)
+    wave_ang = np.exp(wave) if log_wave else np.asarray(wave, float)
 
-    if sigma is None:
-        if snr is None:
-            raise SystemExit("no sigma column found; pass --sigma-col or --snr")
-        sigma = np.abs(flux) / float(snr)
-    return loglam, flux, sigma
+    if wave_frame == "auto":
+        vacuum = any(k in meta for k in ("PYP_SPEC", "DMODCLS")) or str(
+            meta.get("INSTRUME", "")
+        ).upper().startswith(("DEIMOS", "KECK"))
+    else:
+        vacuum = wave_frame == "vacuum"
+    if vacuum:
+        wave_ang = vac_to_air(wave_ang)
+        print("converted observed wavelengths vacuum -> air (matching the air template grid)")
+
+    return np.log(wave_ang), flux, sigma, good
 
 
 def _load_telluric_basis(path, loglam_fit):
@@ -182,13 +219,16 @@ def cmd_fit(args):
     loglam_b, mu, Phi = b["loglam"], b["mu"], b["Phi"]
     R_native_star = float(b["resolution"])
 
-    loglam_o, flux_o, sigma_o = read_spectrum(
+    loglam_o, flux_o, sigma_o, good_o = read_spectrum(
         args.spectrum_file,
         args.wave_col,
         args.flux_col,
         args.sigma_col,
+        args.ivar_col,
+        args.mask_col,
         args.snr,
         args.log_wave,
+        args.wave_frame,
     )
 
     # resample onto the basis grid if the observation is on a different grid
@@ -196,13 +236,17 @@ def cmd_fit(args):
         loglam_o, loglam_b, atol=0, rtol=1e-12
     )
     if same:
-        flux, sigma, mask = flux_o, sigma_o, None
+        flux, sigma, mask = flux_o, sigma_o, good_o
     else:
         flux, sigma, good = toy.resample_to_loglam(loglam_o, flux_o, sigma_o, loglam_b)
         mask = good
+        if good_o is not None:
+            # carry the observed-frame bad-pixel mask onto the basis grid: keep only
+            # destination pixels that interpolate from all-good source pixels.
+            mask = mask & (np.interp(loglam_b, loglam_o, good_o.astype(float)) > 0.999)
         print(
             f"resampled observation onto basis grid "
-            f"({good.sum()} of {loglam_b.size} px in range)"
+            f"({int(np.asarray(mask).sum())} of {loglam_b.size} px usable)"
         )
 
     # optional telluric basis (observed frame, NOT RV-shifted), resampled to grid.
@@ -589,6 +633,13 @@ def build_parser():
     pf.add_argument("--wave-col", default="wave")
     pf.add_argument("--flux-col", default="flux")
     pf.add_argument("--sigma-col", default="sigma")
+    pf.add_argument("--ivar-col", default="ivar",
+                    help="inverse-variance column; sigma=1/sqrt(ivar) when no sigma column")
+    pf.add_argument("--mask-col", default="mask",
+                    help="good-pixel mask column (1=good), honoured if present")
+    pf.add_argument("--wave-frame", choices=["air", "vacuum", "auto"], default="auto",
+                    help="wavelength frame of the input; converted vacuum->air to match the "
+                    "template grid. 'auto' treats PypeIt/DEIMOS products as vacuum (default)")
     pf.add_argument(
         "--snr",
         type=float,
