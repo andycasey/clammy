@@ -214,12 +214,7 @@ def cmd_fit(args):
         )
         tell_basis = (tell_mu, tell_Phi)
 
-    res = fitter.fit_rv(
-        flux,
-        sigma,
-        loglam_b,
-        mu,
-        Phi,
+    fit_kwargs = dict(
         cont_order=args.cont_order,
         vmin=args.vmin,
         vmax=args.vmax,
@@ -236,7 +231,11 @@ def cmd_fit(args):
         fit_vsini=args.fit_vsini,
         vsini_bounds=tuple(args.vsini_bounds),
         epsilon=args.epsilon,
+        rescale_errors=args.rescale_errors,
     )
+    res = fitter.fit_rv(flux, sigma, loglam_b, mu, Phi, **fit_kwargs)
+    if args.rescale_errors:
+        print(f"\n(errors below rescaled by sqrt(chi2/dof) = {res.get('error_rescale', 1.0):.2f})")
 
     print(f"\nv        = {res['v_kms']:+.3f} +/- {res['v_err_kms']:.3f} km/s")
     if args.fit_resolution:
@@ -356,14 +355,16 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
         ax[0].set_ylim(0.0, hi + margin)  # floor at 0, keep the (1-99 pctile + 10%) max
     # title: the RV chain raw -> telluric-zero-point-corrected -> +barycentric, then
     # R/vsini/chi2 and an optional external reference velocity (e.g. the Geha value).
-    title = f"v={res['v_kms']:+.2f}"
-    base = res["v_kms"]
+    v_e = res.get("v_err_kms", float("nan"))
+    title = f"v={res['v_kms']:+.2f}±{v_e:.2f}"
+    base, base_e = res["v_kms"], v_e
     if "v_corr_kms" in res:
-        title += f" -> tell-corr {res['v_corr_kms']:+.2f}"
-        base = res["v_corr_kms"]
+        ce = res.get("v_corr_err_kms", float("nan"))
+        title += f" -> tell-corr {res['v_corr_kms']:+.2f}±{ce:.2f}"
+        base, base_e = res["v_corr_kms"], ce
     if vbary is not None:
         lbl = "bary+tell" if "v_corr_kms" in res else "bary"
-        title += f" -> {lbl} {base + vbary:+.2f}"
+        title += f" -> {lbl} {base + vbary:+.2f}±{base_e:.2f}"
     title += " km/s"
     if "rho_vR" in res:
         title += f", R={res['resolution_R']:.0f}"
@@ -374,7 +375,7 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
         rv, rverr, rname = ref
         title += f"   |   {rname} v={rv:+.2f}"
         if rverr is not None:
-            title += f"$\\pm${rverr:.2f}"
+            title += f"±{rverr:.2f}"
         title += " km/s"
     ax[0].set_title((f"{source}\n" if source else "") + title)
     ax[0].set_ylabel("flux")
@@ -618,6 +619,8 @@ def build_parser():
     pf.add_argument("--ref-name", default="ref", help="label for --ref-v in the plot title")
     pf.add_argument("--vbary", type=float, default=None,
                     help="barycentric velocity correction [km/s] to add to the (telluric-)corrected RV in the title/report")
+    pf.add_argument("--rescale-errors", action="store_true",
+                    help="rescale the formal RV errors by sqrt(chi2/dof) (reduced chi2 -> 1)")
     pf.set_defaults(func=cmd_fit)
 
     return p

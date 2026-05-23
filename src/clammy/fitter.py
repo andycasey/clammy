@@ -343,6 +343,7 @@ def fit_rv(
     n_vsini=8,
     epsilon=0.6,
     return_model=True,
+    rescale_errors=False,
 ):
     """Fit radial velocity (+ optional resolution, vsini, tellurics), weights, continuum.
 
@@ -821,6 +822,18 @@ def fit_rv(
     elif vsini is not None:
         # echo the fixed vsini that was applied to the stellar block.
         out["vsini_kms"] = float(vsini)
+
+    # Optionally rescale the formal (curvature) errors so the reduced chi-square is
+    # 1, i.e. multiply by sqrt(chi2/dof). This folds the fit's own misfit (template
+    # mismatch, correlated residuals) into the reported statistical errors; it is a
+    # rescaling, not an additive systematic floor.
+    if rescale_errors and dof > 0 and np.isfinite(out["chi2_dof"]) and out["chi2_dof"] > 0:
+        s = float(np.sqrt(out["chi2_dof"]))
+        for k in ("v_err_kms", "R_err", "sigma_kms_err",
+                  "vsini_err_kms", "v_tell_err_kms", "v_corr_err_kms"):
+            if k in out and np.isfinite(out[k]):
+                out[k] = float(out[k] * s)
+        out["error_rescale"] = s
 
     if return_model:
         ln_model = np.asarray(A @ jnp.asarray(theta))
