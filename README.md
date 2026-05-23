@@ -1,15 +1,19 @@
-# Joint RV + Template + Continuum (+ Resolution) Fitting for Stellar Spectra
+# Linear Models for Stellar Nuisances
 
-Simultaneously recover **(a)** radial velocity, **(b)** template weights from a
-learned PCA basis, **(c)** low-order continuum coefficients, and optionally **(d)**
-the spectral resolution `R`, from an observed stellar spectrum. The linear algebra,
-the FFTs, and the optimisation all run on **JAX** (float64).
+Analysing stellar spectra requires handling of various nuisances: effects that may
+not be related to our primary goal, but would bias our analysis if we ignored them.
+Depending on your science goal, those nuisances might include: continuum-normalization,
+radial velocity shifts, instrumental broadening, and rotational broadening.
+
+This code uses linear models to simultaneously fit: radial velocity; stellar absorption
+(from a low-dimensional representation); continuum; and broadening.
+The linear algebra, the FFTs, and the optimisation all run on `jax`.
 
 A full derivation (linear template fit → RV scan → FFT acceleration → joint
 RV+weights and its convexity → continuum → convolution/R) is in
 [`docs/formulation.tex`](docs/formulation.pdf), with strict consistent notation.
 
-## Idea
+## Principle
 
 Resample to a uniform **log-wavelength** grid `x = ln λ`, so a radial velocity `v`
 acts as a pure translation `T(x) → T(x − Δx)` with `Δx = ln(1 + v/c)`. Working in
@@ -20,8 +24,8 @@ ln d(x) ≈ Σ_k w_k · T_k(x − Δx)  +  Σ_m c_m · P_m(x)
           └─ rectified templates ─┘   └─ Legendre log-continuum ─┘
 ```
 
-The templates `T_k = [μ, Φ_1, …, Φ_K]` are the mean + PCA components of the
-*rectified* model grid; `P_m` are Legendre polynomials. At fixed `Δx` the model is
+The templates `T_k = [μ, Φ_1, …, Φ_K]` are the basis of *rectified* model grid 
+(e.g., perhaps a mean and PCA); `P_m` are Legendre polynomials. At fixed `Δx` the model is
 **linear** in `θ = (w, c)`, so we **solve linearly inside, scan `Δx` outside**:
 
 ```
@@ -162,18 +166,6 @@ res = fitter.fit_rv(d, sigma, b["loglam"], b["mu"], b["Phi"],
 res["v_kms"], res["resolution_R"], res["R_err"], res["cov_vR"]
 ```
 
-## Outputs
-
-- `outputs/basis.npz` — `loglam`, `mu`, `Phi (K×n_pix)`, variance ratios, grid labels.
-- `outputs/basis_diagnostics.png`, `outputs/rectify_example.png` — Task 1 diagnostics.
-- `outputs/validate_snr_recovery.png` — RV/w/c recovery & error calibration vs SNR.
-- `outputs/validate_example_fit.png` — data/model/residuals + the χ²(v) scan.
-- `outputs/validate_v_sweep.png` — RV bias vs true velocity.
-- `outputs/validate_sweeps.png` — continuum-order & basis-size sweeps.
-- `outputs/validate_resolution_snr.png` — joint `(v,R)` recovery & calibration vs SNR.
-- `outputs/validate_resolution_RvR.png` — recovered `R` vs true `R`.
-- `outputs/validate_resolution_resampled.png` — fit to a degraded spectrum on a *different* grid + the χ²(v,R) surface.
-- `docs/formulation.pdf` — the methods derivation.
 
 ## Validation summary
 
@@ -188,3 +180,4 @@ Leave-one-out (basis never saw the test star; metal-poor RGB, Teff 4500 / log g 
 - Tonry & Davis (1979) — cross-correlation RVs.
 - Cappellari (2017) — pPXF (additive + multiplicative polynomials; canonical implementation).
 - Bolton et al. (2012) — BOSS PCA-template + redshift-scan classification.
+- Geha et al. (2026) - DIEMOS analysis
