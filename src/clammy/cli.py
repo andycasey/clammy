@@ -269,12 +269,46 @@ def _load_telluric_basis(path, loglam_fit):
 
 
 def cmd_fit(args):
+    paths = args.spectrum_files
+    if len(paths) > 1 and (args.plot or args.scan_plot or args.out):
+        raise SystemExit(
+            "with multiple spectra use --plots (auto-named per input); "
+            "--plot/--scan-plot/--out each take a single output file"
+        )
+
+    # Load the (shared) bases once; the per-spectrum fits below reuse the JIT-compiled
+    # kernels (identical array shapes on the basis grid), so spectra after the first
+    # skip XLA compilation.
     b = basis.load_basis(args.basis_file)
     loglam_b, mu, Phi = b["loglam"], b["mu"], b["Phi"]
     R_native_star = float(b["resolution"])
 
+    tell_basis = None
+    R_native_tell = np.inf
+    if args.telluric_basis:
+        tell_mu, tell_Phi, R_native_tell = _load_telluric_basis(
+            args.telluric_basis, np.asarray(loglam_b, float)
+        )
+        tell_basis = (tell_mu, tell_Phi)
+
+    ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
+
+    for i, path in enumerate(paths):
+        if len(paths) > 1:
+            print(f"\n=== [{i + 1}/{len(paths)}] {os.path.basename(path)} ===")
+        try:
+            _fit_one(path, args, loglam_b, mu, Phi, R_native_star,
+                     tell_basis, R_native_tell, ref)
+        except Exception as exc:  # don't let one bad spectrum abort a batch
+            if len(paths) == 1:
+                raise
+            print(f"  ERROR fitting {path}: {exc}", file=sys.stderr)
+
+
+def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_tell, ref):
+    """Fit one spectrum and write its report, JSON, and plots."""
     loglam_o, flux_o, sigma_o, good_o = read_spectrum(
-        args.spectrum_file,
+        path,
         args.wave_col,
         args.flux_col,
         args.sigma_col,
@@ -303,15 +337,6 @@ def cmd_fit(args):
             f"({int(np.asarray(mask).sum())} of {loglam_b.size} px usable)"
         )
 
-    # optional telluric basis (observed frame, NOT RV-shifted), resampled to grid.
-    tell_basis = None
-    R_native_tell = np.inf
-    if args.telluric_basis:
-        tell_mu, tell_Phi, R_native_tell = _load_telluric_basis(
-            args.telluric_basis, np.asarray(loglam_b, float)
-        )
-        tell_basis = (tell_mu, tell_Phi)
-
     fit_kwargs = dict(
         cont_order=args.cont_order,
         vmin=args.vmin,
@@ -336,7 +361,7 @@ def cmd_fit(args):
         print(f"\n(errors below rescaled by sqrt(chi2/dof) = {res.get('error_rescale', 1.0):.2f})")
 
     # barycentric correction: use --vbary if given, else infer it from the FITS header.
-    vbary = args.vbary if args.vbary is not None else _auto_vbary(args.spectrum_file)
+    vbary = args.vbary if args.vbary is not None else _auto_vbary(path)
 
     print(f"\nv        = {res['v_kms']:+.3f} +/- {res['v_err_kms']:.3f} km/s")
     if args.fit_resolution:
@@ -415,15 +440,18 @@ def cmd_fit(args):
             json.dump(payload, fh, indent=2)
         print(f"wrote results -> {args.out}")
 
-    ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
-    if args.plot:
-        _plot_fit(loglam_b, flux, sigma, res, args.plot,
-                  source=os.path.basename(args.spectrum_file), ref=ref, vbary=vbary)
-        print(f"wrote plot -> {args.plot}")
-
-    if args.scan_plot:
-        _plot_scan(res, args.scan_plot, source=os.path.basename(args.spectrum_file))
-        print(f"wrote scan plot -> {args.scan_plot}")
+    # output plots: explicit --plot/--scan-plot, or auto-named "<spectrum>-{fit,scan}.png"
+    # next to each input when --plots is given.
+    stem = os.path.splitext(path)[0]
+    fit_png = args.plot or (f"{stem}-fit.png" if args.plots else None)
+    scan_png = args.scan_plot or (f"{stem}-scan.png" if args.plots else None)
+    if fit_png:
+        _plot_fit(loglam_b, flux, sigma, res, fit_png,
+                  source=os.path.basename(path), ref=ref, vbary=vbary)
+        print(f"wrote plot -> {fit_png}")
+    if scan_png:
+        _plot_scan(res, scan_png, source=os.path.basename(path))
+        print(f"wrote scan plot -> {scan_png}")
 
 
 def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None):
@@ -624,7 +652,9 @@ def build_parser():
         epilog=_FIT_EPILOG,
     )
     pf.add_argument("basis_file", help="stellar basis .npz from `clammy build`")
-    pf.add_argument("spectrum_file", help="observed spectrum (.npz or FITS table)")
+    pf.add_argument("spectrum_files", nargs="+", metavar="spectrum",
+                    help="observed spectrum/spectra (.npz or FITS table); multiple are "
+                    "fit in one process, reusing the JIT-compiled kernels")
     pf.add_argument(
         "--telluric-basis",
         default=None,
@@ -721,10 +751,13 @@ def build_parser():
         action="store_false",
         help="treat the wavelength column as linear (Angstrom)",
     )
-    pf.add_argument("--out", "-o", default=None, help="write results JSON")
-    pf.add_argument("--plot", default=None, help="write a data/model/residual plot")
+    pf.add_argument("--out", "-o", default=None, help="write results JSON (single spectrum)")
+    pf.add_argument("--plot", default=None, help="write a data/model/residual plot (single spectrum)")
     pf.add_argument("--scan-plot", default=None,
-                    help="write the coarse-scan chi2 surface: chi2(v, R) if --fit-resolution, else chi2(v)")
+                    help="write the coarse-scan chi2 surface (single spectrum): chi2(v, R) if --fit-resolution, else chi2(v)")
+    pf.add_argument("--plots", action="store_true",
+                    help="save <spectrum>-fit.png and <spectrum>-scan.png next to each input "
+                    "(works for any number of spectra)")
     pf.add_argument("--ref-v", type=float, default=None,
                     help="reference RV [km/s] to show in the plot title (e.g. a catalog value)")
     pf.add_argument("--ref-v-err", type=float, default=None, help="uncertainty on --ref-v [km/s]")
