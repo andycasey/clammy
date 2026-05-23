@@ -14,6 +14,7 @@ dist/
 grid/original/
 grid/convolved/
 grid/telluric/
+deimos-test/
 outputs/*.npz
 docs/*.aux
 docs/*.log
