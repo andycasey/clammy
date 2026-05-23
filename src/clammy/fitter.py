@@ -351,6 +351,8 @@ def fit_rv(
     return_model=True,
     rescale_errors=False,
     n_conv_iter=0,
+    nnls_stellar=False,
+    nnls_telluric=False,
 ):
     """Fit radial velocity (+ optional resolution, vsini, tellurics), weights, continuum.
 
@@ -815,6 +817,7 @@ def fit_rv(
         p_tell_star = 0.0; tell_col = None
 
     # --- exact final solve at the optimum (iter 0; delta = 0) ------------------
+    _lnd_fit = lnd   # tracks which log-data fed the last linear solve (updated in conv loop)
     chi2_exact, theta, cov, A = _exact_at(p_star, sp_star, vsp_star, p_tell_star)
     theta = np.asarray(theta)
 
@@ -839,6 +842,7 @@ def fit_rv(
 
             # corrected log-data and its lnd-dependent normal-equation pieces.
             lnd_eff = np.where(good, lnd - delta, 0.0)
+            _lnd_fit = lnd_eff   # NNLS post-step uses the same corrected data
             lnd_eff_j = jnp.asarray(lnd_eff)
             const_eff_j = jnp.sum(Wj * lnd_eff_j * lnd_eff_j)
 
@@ -879,6 +883,41 @@ def fit_rv(
         ln_model_final = A_np_final @ theta + (delta_star + delta_tell)
         chi2_exact = float(np.sum(np.asarray(W) * np.where(
             good, lnd - ln_model_final, 0.0) ** 2))
+
+    # --- NNLS post-refinement: enforce non-negative weights for NMF bases --------
+    # The nonlinear params (v, R, vsini) are fixed at their Newton optimum; only
+    # the linear weights are re-solved under non-negativity constraints.
+    # scipy.linalg.lsq_linear (BVLS) solves the bounded weighted LS system
+    #   min || sqrt(W) (A theta - y) ||^2   s.t.  lb <= theta <= +inf
+    # where lb = 0 for NMF-basis columns and -inf for continuum columns.
+    # If a linear-flux correction was applied (n_conv_iter >= 1), the same
+    # corrected data _lnd_fit = lnd_eff is used here to stay consistent.
+    if nnls_stellar or (nnls_telluric and J_tell > 0):
+        from scipy.optimize import lsq_linear
+        A_np = np.asarray(A)
+        D_tot = A_np.shape[1]
+        lb = np.full(D_tot, -np.inf)
+        if nnls_stellar:
+            lb[:Ktot] = 0.0
+        if nnls_telluric and J_tell > 0:
+            lb[Ktot:Ktot + J_tell] = 0.0
+        sqrtW = np.sqrt(W)
+        A_w = sqrtW[:, None] * A_np
+        y_w = sqrtW * _lnd_fit
+        if float(ridge) > 0:
+            sq_r = np.sqrt(float(ridge))
+            A_w = np.vstack([A_w, sq_r * np.eye(D_tot)])
+            y_w = np.concatenate([y_w, np.zeros(D_tot)])
+        result = lsq_linear(A_w, y_w, bounds=(lb, np.full(D_tot, np.inf)), method="bvls")
+        theta = result.x
+        # Recompute chi2 (and the conv correction if needed) at the new theta.
+        if delta_star is not None:
+            delta_star, delta_tell, E_star_block, E_tell_block = _delta(
+                theta, p_star, sp_star, vsp_star, p_tell_star)
+            ln_model_nnls = A_np @ theta + (delta_star + delta_tell)
+            chi2_exact = float(np.sum(W * np.where(good, lnd - ln_model_nnls, 0.0) ** 2))
+        else:
+            chi2_exact = float(np.sum(W * np.where(good, (_lnd_fit - A_np @ theta) ** 2, 0.0)))
 
     dx_star = p_star * dln
     v_star = C_LIGHT_KMS * np.expm1(dx_star)

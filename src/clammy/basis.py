@@ -299,7 +299,7 @@ def build_telluric_basis(loglam, flux, order=5, var_target=0.99, max_k=None, **c
 
 
 def save_basis(path, loglam, mu, Phi, params, info, rectify_order, frame="rest",
-               resolution=np.inf):
+               resolution=np.inf, method="pca"):
     """Save the basis to a ``.npz`` file.
 
     The archive uses the npz key contract documented in the module docstring:
@@ -348,6 +348,7 @@ def save_basis(path, loglam, mu, Phi, params, info, rectify_order, frame="rest",
         rectify_order=rectify_order,
         frame=frame,
         resolution=float(resolution),
+        method=method,
     )
     # Stellar labels are optional: present for a stellar basis, absent for a
     # telluric one. Only store them if all three are available.
@@ -381,4 +382,8 @@ def load_basis(path):
         out["resolution"] = float(np.asarray(out["resolution"]).item())
     else:
         out["resolution"] = float(np.inf)
+    if "method" in out:
+        out["method"] = str(np.asarray(out["method"]).item())
+    else:
+        out["method"] = "pca"
     return out

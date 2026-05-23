@@ -70,6 +70,7 @@ def cmd_build(args):
             rectify_order=args.order,
             frame="observed",
             resolution=resolution,
+            method=args.basis,
         )
         print(
             "NOTE: telluric basis built/stored in the OBSERVED (topocentric) "
@@ -103,6 +104,7 @@ def cmd_build(args):
         rectify_order=args.order,
         frame="rest",
         resolution=resolution,
+        method=args.basis,
     )
     print(f"wrote basis -> {args.out} (frame=rest, resolution={resolution})")
 
@@ -243,10 +245,10 @@ def _auto_vbary(path):
 def _load_telluric_basis(path, loglam_fit):
     """Load a telluric basis and resample it onto the fitting grid.
 
-    Returns ``(tell_mu, tell_Phi, R_native_tell)``. The telluric basis must be in
-    the OBSERVED frame (warn loudly otherwise). Its ``mu`` and every row of
-    ``Phi`` are interpolated with ``np.interp`` onto ``loglam_fit`` when the grids
-    differ; if they are identical the arrays are passed through unchanged.
+    Returns ``(tell_mu, tell_Phi, R_native_tell, method)``. The telluric basis
+    must be in the OBSERVED frame (warn loudly otherwise). Its ``mu`` and every
+    row of ``Phi`` are interpolated with ``np.interp`` onto ``loglam_fit`` when
+    the grids differ; if they are identical the arrays are passed through unchanged.
     """
     tb = basis.load_basis(path)
     if tb["frame"] != "observed":
@@ -274,7 +276,7 @@ def _load_telluric_basis(path, loglam_fit):
             f"resampled telluric basis onto the fitting grid "
             f"({loglam_t.size} -> {loglam_fit.size} px)"
         )
-    return tell_mu, tell_Phi, float(tb["resolution"])
+    return tell_mu, tell_Phi, float(tb["resolution"]), str(tb.get("method", "pca"))
 
 
 def cmd_fit(args):
@@ -291,14 +293,23 @@ def cmd_fit(args):
     b = basis.load_basis(args.basis_file)
     loglam_b, mu, Phi = b["loglam"], b["mu"], b["Phi"]
     R_native_star = float(b["resolution"])
+    nnls_stellar = (b.get("method", "pca") == "nmf")
 
     tell_basis = None
     R_native_tell = np.inf
+    nnls_telluric = False
     if args.telluric_basis:
-        tell_mu, tell_Phi, R_native_tell = _load_telluric_basis(
+        tell_mu, tell_Phi, R_native_tell, tell_method = _load_telluric_basis(
             args.telluric_basis, np.asarray(loglam_b, float)
         )
         tell_basis = (tell_mu, tell_Phi)
+        nnls_telluric = (tell_method == "nmf")
+
+    if nnls_stellar or nnls_telluric:
+        which = " + ".join(
+            (["stellar"] if nnls_stellar else []) + (["telluric"] if nnls_telluric else [])
+        )
+        print(f"NMF basis detected ({which}): weights will be non-negative (NNLS post-refine).")
 
     ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
 
@@ -307,14 +318,16 @@ def cmd_fit(args):
             print(f"\n=== [{i + 1}/{len(paths)}] {os.path.basename(path)} ===")
         try:
             _fit_one(path, args, loglam_b, mu, Phi, R_native_star,
-                     tell_basis, R_native_tell, ref)
+                     tell_basis, R_native_tell, ref,
+                     nnls_stellar=nnls_stellar, nnls_telluric=nnls_telluric)
         except Exception as exc:  # don't let one bad spectrum abort a batch
             if len(paths) == 1:
                 raise
             print(f"  ERROR fitting {path}: {exc}", file=sys.stderr)
 
 
-def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_tell, ref):
+def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_tell, ref,
+             nnls_stellar=False, nnls_telluric=False):
     """Fit one spectrum and write its report, JSON, and plots."""
     loglam_o, flux_o, sigma_o, good_o = read_spectrum(
         path,
@@ -365,6 +378,8 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         epsilon=args.epsilon,
         rescale_errors=args.rescale_errors,
         n_conv_iter=args.conv_iter,
+        nnls_stellar=nnls_stellar,
+        nnls_telluric=nnls_telluric,
     )
     res = fitter.fit_rv(flux, sigma, loglam_b, mu, Phi, **fit_kwargs)
     if args.rescale_errors:
