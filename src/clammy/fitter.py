@@ -250,7 +250,7 @@ def _profiled_chi2(x, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
 
 
 @partial(jax.jit, static_argnames=("n", "fit_R", "fit_vsini", "fit_tell", "max_iter", "max_ls"))
-def _newton_jit(x0, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
+def _newton_jit(x0, lo, hi, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
                 sig_nat_star, sig_nat_tell, sig_obs_fixed, vsini_fixed, epsilon,
                 n, fit_R, fit_vsini, fit_tell, max_iter=15, max_ls=25, c1=1e-4,
                 shrink=0.5, ftol=1e-2):
@@ -277,6 +277,11 @@ def _newton_jit(x0, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
     vg = jax.value_and_grad(obj)
     hess = jax.hessian(obj)
     eye = jnp.eye(x0.size)
+    # box-constrain to the requested bounds: lo/hi are +/-inf for the unbounded
+    # parameters (RV lag, telluric lag) and the R/vsini limits for the broadening
+    # ones. Every trial point in the line search is projected back into the box, so
+    # the refined value can never drift outside the bounds the caller gave.
+    x0 = jnp.clip(x0, lo, hi)
 
     # Fixed-metric ("modified") Newton: the Hessian of a chi2 surface is ~constant
     # over the quadratic basin, so we factor it ONCE at the coarse-scan start and
@@ -308,10 +313,11 @@ def _newton_jit(x0, Tf, Sf, Pj, Wj, lndj, freq, j_off, const, ridge,
         def lbody(st):
             t, _f, i = st
             tn = t * shrink
-            return tn, obj(x + tn * dx), i + 1
+            return tn, obj(jnp.clip(x + tn * dx, lo, hi)), i + 1
 
-        t, f_new, _ = jax.lax.while_loop(lcond, lbody, (1.0, obj(x + dx), 0))
-        return x + t * dx, f_new, (f_prev - f_new) < ftol, it + 1
+        t, f_new, _ = jax.lax.while_loop(
+            lcond, lbody, (1.0, obj(jnp.clip(x + dx, lo, hi)), 0))
+        return jnp.clip(x + t * dx, lo, hi), f_new, (f_prev - f_new) < ftol, it + 1
 
     x, _, _, _ = jax.lax.while_loop(cond, step, (x0, obj(x0), False, 0))
     H = hess(x)
@@ -576,8 +582,21 @@ def fit_rv(
     eps_j = jnp.asarray(float(epsilon))
 
     def _refine(x0, fit_R, fit_vs, sig_obs_fix, vsini_fix, fit_t):
+        # box bounds matching the x0 layout [p (, sigma_obs)(, vsini)(, p_tell)].
+        # R in [RMIN, RMAX] <-> sigma_obs in [sigpix(RMAX), sigpix(RMIN)].
+        lo, hi = [-np.inf], [np.inf]
+        if fit_R:
+            lo.append(float(sigpix_of_R(R_bounds[1])))
+            hi.append(float(sigpix_of_R(R_bounds[0])))
+        if fit_vs:
+            lo.append(float(vsini_bounds[0] / velscale))
+            hi.append(float(vsini_bounds[1] / velscale))
+        if fit_t:
+            lo.append(-np.inf)
+            hi.append(np.inf)
         x_star, H = _newton_jit(
-            jnp.asarray(x0), Tf, Sf, Pj, Wj, lndj, freq, j_off, const_j, ridge_j,
+            jnp.asarray(x0), jnp.asarray(lo), jnp.asarray(hi),
+            Tf, Sf, Pj, Wj, lndj, freq, j_off, const_j, ridge_j,
             sig_nat_star_j, sig_nat_tell_j, jnp.asarray(float(sig_obs_fix)),
             jnp.asarray(float(vsini_fix)), eps_j, n=n, fit_R=fit_R, fit_vsini=fit_vs,
             fit_tell=fit_t)
