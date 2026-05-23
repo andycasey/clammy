@@ -522,6 +522,25 @@ linear-flux convolution, by contrast, would mix the components nonlinearly
 $T_k$ unless one broadens a \emph{single} fixed spectrum), breaking the linearity
 of the inner solve for a multi-component basis.
 
+\paragraph{Removing the core bias by iteration.}
+The bias is, however, removable without giving up the linear inner solve, by a
+fixed-point iteration. Write the log-space-broadened model block as $A_c =
+\mathrm{LSF}\!*\!M_c$ and the exact one as $E_c = \ln(\mathrm{LSF}\!*\!e^{M_c})$,
+where $M_c$ is the (un-broadened, shifted) log-flux of component $c\in\{\text{star,
+tell}\}$ from the current solution. Their difference $\delta = \sum_c (E_c - A_c)$
+is precisely the $\tfrac12\Var$-and-higher correction (concentrated in the cores).
+Since the exact model is $E = A + \delta$, fitting the \emph{linear} machinery to
+the corrected data $\mathbf{Y} - \delta$ makes the exact model match the data; as
+$\delta$ depends on the solution we iterate $\delta\!\to\!\text{fit}\!\to\!\delta$
+to a fixed point. Each pass is the usual linear solve (the normal matrix is
+unchanged; only the right-hand side moves) plus one forward linear-flux
+convolution, and the nonlinear parameters are re-optimised against the corrected
+data, so the resolution bias is removed as well. On an in-basis test the reduced
+$\chi^2$ falls from $\sim\!40$ to $\sim\!1$ and the recovered $R$ bias from
+$\sim\!-2\%$ to $\lesssim 0.1\%$; the iteration converges geometrically (a handful
+to $\sim\!10$ steps). This is the \texttt{n\_conv\_iter} option (off by default,
+which leaves the fast first-order approximation untouched).
+
 \paragraph{Beyond a single Gaussian.}
 For a wavelength-dependent $R(\lambda)$ or a non-Gaussian LSF there is no
 closed-form Fourier multiply. The practical remedy is to precompute banded

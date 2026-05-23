@@ -67,8 +67,14 @@ $`(\Delta x, R)`$. Caveat: the LSF convolves *linear* flux, but to keep the inne
 solve linear we broaden the *log*-rectified templates; this matches the exact
 linear-flux convolution to first order and slightly over-deepens saturated cores
 (the toy uses the exact linear-flux convolution, so the validation measures the
-residual ~2% $`R`$ bias). For wavelength-dependent $`R`$/non-Gaussian LSFs, precompute
-banded convolution matrices on an $`R`$-grid and interpolate.
+residual ~2% $`R`$ bias). This core bias is removable with `--conv-iter N`
+(`n_conv_iter`): a fixed-point that subtracts the exact-minus-log convolution
+correction $`\delta = \ln(\mathrm{LSF}\otimes e^{M}) - \mathrm{LSF}\!\cdot\!M`$ from
+the data and re-fits, so the *exact* linear-flux model matches the data and $`R`$ is
+unbiased — on an in-basis test χ²/dof falls ~40 → ~1 and the deep-core residuals
+~60σ → ~4σ (it converges in ~8–12 iterations, so it is off by default). For
+wavelength-dependent $`R`$/non-Gaussian LSFs, precompute banded convolution matrices
+on an $`R`$-grid and interpolate.
 
 ### Extended forward model: tellurics, rotation, and native resolution
 
