@@ -14,6 +14,38 @@ Pipeline:
 The saved basis is (mean spectrum mu, components Phi). In the forward model the
 "templates" are [mu, Phi_1, ..., Phi_K]; mu enters with a free weight so it is
 shifted by the RV like any other template.
+
+Frames
+------
+The same rectify+PCA machinery serves two physically distinct kinds of basis,
+distinguished only by the ``frame`` recorded alongside them:
+
+* a STELLAR basis (``frame="rest"``) lives in the stellar *rest* frame and is
+  RV-shifted by the fitter to match the observed spectrum;
+* a TELLURIC basis (``frame="observed"``) lives in the *observed* (topocentric)
+  frame -- Earth's atmosphere imprints absorption at fixed observed wavelengths
+  regardless of the star's motion -- so it must NOT be RV-shifted.
+
+We only build and store the basis here; the fitter reads the ``frame`` metadata
+to decide whether to apply the RV shift. ``build_telluric_basis`` is the
+documented entry point for the telluric case.
+
+npz key contract
+----------------
+Every saved basis carries the common keys::
+
+    loglam, mu, Phi, evals, var_ratio, cumvar, K, rectify_order, frame, resolution
+
+A stellar basis additionally stores ``teff, logg, feh``. ``resolution`` is the
+native resolving power R = lambda / delta-lambda of the model grid the basis was
+built from (assumed constant, i.e. a constant velocity width on the log-lambda
+grid); ``np.inf`` is the sentinel meaning "effectively unresolved / infinite
+native resolution" and reproduces the historical full-broadening behaviour. The
+fitter uses it to broaden the template differentially from its native resolution
+up to the observed instrument resolution in quadrature
+(``sigma_diff^2 = max(0, sigma_obs^2 - sigma_native^2)``). The stellar and
+telluric grids may have different native resolutions, so each basis carries its
+own.
 """
 import numpy as np
 from numpy.polynomial import legendre as npleg
@@ -100,10 +132,96 @@ def build_pca(R, var_target=0.99, max_k=None):
     return mu, Phi, info
 
 
-def save_basis(path, loglam, mu, Phi, params, info, rectify_order):
-    """Save the basis to a ``.npz`` file."""
-    np.savez(
-        path,
+def build_telluric_basis(loglam, flux, order=5, var_target=0.99, max_k=None, **clip_kw):
+    """Build a telluric template basis from a grid of telluric models.
+
+    This is a thin convenience wrapper that runs the *identical* rectify+PCA
+    pipeline used for the stellar basis (:func:`rectify_grid` then
+    :func:`build_pca`) -- the math does not care what produced the spectra. The
+    one thing that differs is *interpretation*:
+
+        The returned basis is meant to be applied in the OBSERVED (topocentric)
+        frame, with NO radial-velocity shift.
+
+    Telluric absorption is imprinted by Earth's atmosphere at fixed observed
+    wavelengths, independent of the star's motion, so unlike the stellar basis
+    (which lives in the rest frame and is RV-shifted to match the data) the
+    telluric basis is held fixed in the observed frame. Persist this by passing
+    ``frame="observed"`` (and ``params=None``) to :func:`save_basis`; the fitter
+    reads that ``frame`` flag to skip the RV shift.
+
+    Parameters
+    ----------
+    loglam : (n_pix,) ndarray
+        Shared natural-log wavelength grid.
+    flux : (n_spec, n_pix) ndarray
+        Strictly positive telluric model flux (e.g. from
+        :func:`clammy.grid.load_spectra`).
+    order : int
+        Legendre order for the robust log-space continuum rectification.
+    var_target : float
+        Cumulative-variance target for the PCA truncation.
+    max_k : int | None
+        Optional cap on the number of retained components.
+    **clip_kw
+        Forwarded to :func:`fit_log_continuum` (``niter``, ``low``, ``high``).
+
+    Returns
+    -------
+    mu   : (n_pix,)        mean rectified spectrum
+    Phi  : (K, n_pix)      unit-norm principal directions (templates)
+    info : dict            'evals', 'var_ratio', 'cumvar', 'K'
+
+    Notes
+    -----
+    The return signature mirrors the stellar path exactly, so a caller can hand
+    ``(mu, Phi, info)`` straight to :func:`save_basis` (with
+    ``params=None, frame="observed"``).
+    """
+    R, _ = rectify_grid(loglam, flux, order=order, **clip_kw)
+    return build_pca(R, var_target=var_target, max_k=max_k)
+
+
+def save_basis(path, loglam, mu, Phi, params, info, rectify_order, frame="rest",
+               resolution=np.inf):
+    """Save the basis to a ``.npz`` file.
+
+    The archive uses the npz key contract documented in the module docstring:
+    the common keys ``loglam, mu, Phi, evals, var_ratio, cumvar, K,
+    rectify_order, frame, resolution`` are always written, plus ``teff, logg,
+    feh`` for a stellar basis.
+
+    Parameters
+    ----------
+    path : str
+        Output ``.npz`` path.
+    loglam, mu, Phi : ndarray
+        Shared log-lambda grid, mean spectrum, and principal components.
+    params : dict | None
+        Stellar labels ``{'teff', 'logg', 'feh'}``. For an unlabelled
+        (telluric) basis pass ``None``; if ``None`` (or missing those keys) the
+        label arrays are simply omitted from the archive.
+    info : dict
+        Output of :func:`build_pca` (``'evals'``, ``'var_ratio'``,
+        ``'cumvar'``, ``'K'``).
+    rectify_order : int
+        Legendre order used for rectification.
+    frame : str
+        Reference frame the basis lives in: ``"rest"`` for a stellar basis
+        (RV-shifted by the fitter) or ``"observed"`` for a telluric basis (held
+        fixed in the topocentric frame, never RV-shifted). Always stored.
+    resolution : float
+        Native resolving power R = lambda / delta-lambda of the model grid this
+        basis was built from (assumed constant -- a constant R is a constant
+        velocity width on the log-lambda grid, which the fitter relies on). This
+        is a build-time *input* (the CLI passes it through), not something
+        derived from the grid here. Always stored as a float scalar. The default
+        ``np.inf`` is the sentinel for "effectively unresolved / infinite native
+        resolution" and reproduces the historical full-broadening behaviour
+        (e.g. raw PHOENIX HiRes, far higher resolution than any observed
+        instrument).
+    """
+    arrays = dict(
         loglam=loglam,
         mu=mu,
         Phi=Phi,
@@ -112,13 +230,39 @@ def save_basis(path, loglam, mu, Phi, params, info, rectify_order):
         cumvar=info["cumvar"],
         K=info["K"],
         rectify_order=rectify_order,
-        teff=params["teff"],
-        logg=params["logg"],
-        feh=params["feh"],
+        frame=frame,
+        resolution=float(resolution),
     )
+    # Stellar labels are optional: present for a stellar basis, absent for a
+    # telluric one. Only store them if all three are available.
+    if params is not None and all(k in params for k in ("teff", "logg", "feh")):
+        arrays.update(teff=params["teff"], logg=params["logg"], feh=params["feh"])
+    np.savez(path, **arrays)
 
 
 def load_basis(path):
-    """Load a basis ``.npz`` as a dict of arrays/scalars."""
+    """Load a basis ``.npz`` as a dict of arrays/scalars.
+
+    Returns the npz key contract documented in the module docstring. Backward
+    compatible with bases written before the ``frame`` and ``resolution`` keys
+    existed:
+
+    * a missing ``frame`` defaults to ``"rest"`` (pre-frame bases are stellar);
+    * a missing ``resolution`` defaults to ``np.inf`` (the historical
+      full-broadening behaviour).
+
+    The ``frame`` value is returned as a clean python ``str`` and ``resolution``
+    as a clean python ``float`` (np.savez stores these as 0-d arrays / np
+    scalars) so callers can compare/use them directly.
+    """
     with np.load(path, allow_pickle=False) as d:
-        return {k: d[k] for k in d.files}
+        out = {k: d[k] for k in d.files}
+    if "frame" in out:
+        out["frame"] = str(np.asarray(out["frame"]).item())
+    else:
+        out["frame"] = "rest"
+    if "resolution" in out:
+        out["resolution"] = float(np.asarray(out["resolution"]).item())
+    else:
+        out["resolution"] = float(np.inf)
+    return out
