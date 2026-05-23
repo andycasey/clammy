@@ -132,6 +132,122 @@ def build_pca(R, var_target=0.99, max_k=None):
     return mu, Phi, info
 
 
+def build_nmf(R, K, max_iter=500, tol=1e-4, random_state=0):
+    """NMF of the rectified spectra, operated on τ = −R ≥ 0.
+
+    Returns the same ``(mu, Phi, info)`` signature as :func:`build_pca` so
+    the result can be handed directly to :func:`save_basis` and the fitter.
+    ``Phi`` rows are the NMF components negated back to log-flux space
+    (absorption templates, ≤ 0 in lines, matching the PCA convention).
+
+    Initialised via NNDSVD (truncated SVD of τ), then refined with Lee &
+    Seung multiplicative updates until the relative Frobenius-norm change
+    falls below ``tol`` (checked every 10 iterations) or ``max_iter`` is
+    reached.
+
+    Parameters
+    ----------
+    R : (n_spec, n_pix) ndarray
+        Rectified log-flux spectra (≤ 0 in absorption lines).
+    K : int
+        Number of NMF components (exact, unlike the variance-target of PCA).
+    max_iter : int
+        Maximum multiplicative-update iterations.
+    tol : float
+        Relative Frobenius-norm convergence tolerance.
+    random_state : int
+        Seed for reproducible random initialisation fallback.
+
+    Returns
+    -------
+    mu     : (n_pix,)    mean rectified spectrum
+    Phi    : (K, n_pix)  unit-norm NMF absorption templates in log-flux space
+    info   : dict        'K', 'evals' (zeros), 'var_ratio', 'cumvar'
+    """
+    eps = 1e-10
+    rng = np.random.default_rng(random_state)
+
+    mu = R.mean(axis=0)
+    tau = np.maximum(-R, 0.0)   # non-negative optical depth, (n_spec, n_pix)
+    n_spec, n_pix = tau.shape
+    K = max(1, min(K, n_spec, n_pix))
+
+    # NNDSVD initialisation (Boutsidis & Gallopoulos 2008)
+    try:
+        from scipy.sparse.linalg import svds
+        k_svd = min(K, min(n_spec, n_pix) - 1)
+        v0 = rng.standard_normal(min(n_spec, n_pix))
+        U, S, Vt = svds(tau, k=k_svd, v0=v0)
+        # svds returns ascending order; flip to descending
+        U, S, Vt = U[:, ::-1], S[::-1], Vt[::-1, :]
+        W = np.empty((n_spec, K))
+        H = np.empty((K, n_pix))
+        for k in range(K):
+            if k == 0:
+                W[:, k] = np.sqrt(S[0]) * np.abs(U[:, 0])
+                H[k, :] = np.sqrt(S[0]) * np.abs(Vt[0, :])
+            else:
+                up = np.maximum( U[:, k], 0.0); um = np.maximum(-U[:, k], 0.0)
+                vp = np.maximum( Vt[k, :], 0.0); vm = np.maximum(-Vt[k, :], 0.0)
+                np_val = np.linalg.norm(up) * np.linalg.norm(vp)
+                nm_val = np.linalg.norm(um) * np.linalg.norm(vm)
+                if np_val >= nm_val:
+                    nu = np.linalg.norm(up) + eps; nv = np.linalg.norm(vp) + eps
+                    f = np.sqrt(S[k] * np_val)
+                    W[:, k] = f * up / nu; H[k, :] = f * vp / nv
+                else:
+                    nu = np.linalg.norm(um) + eps; nv = np.linalg.norm(vm) + eps
+                    f = np.sqrt(S[k] * nm_val)
+                    W[:, k] = f * um / nu; H[k, :] = f * vm / nv
+        W = np.maximum(W, eps)
+        H = np.maximum(H, eps)
+    except Exception:
+        W = rng.uniform(0.0, 1.0, (n_spec, K))
+        H = rng.uniform(0.0, 1.0, (K, n_pix))
+
+    # Lee & Seung multiplicative updates
+    prev_loss = np.inf
+    for it in range(max_iter):
+        WH = W @ H
+        H *= (W.T @ tau) / (W.T @ WH + eps)
+        np.maximum(H, eps, out=H)
+        WH = W @ H
+        W *= (tau @ H.T) / (WH @ H.T + eps)
+        np.maximum(W, eps, out=W)
+        if (it + 1) % 10 == 0:
+            loss = np.linalg.norm(tau - W @ H, "fro") ** 2
+            converged = prev_loss < np.inf and abs(prev_loss - loss) / (prev_loss + eps) < tol
+            prev_loss = loss
+            if converged:
+                print(f"  NMF converged at iteration {it + 1}, loss={loss:.4e}")
+                break
+
+    # Normalise H rows to unit norm (mirrors PCA convention)
+    norms = np.linalg.norm(H, axis=1)
+    norms[norms == 0] = 1.0
+    Phi = -(H / norms[:, None])  # log-flux absorption templates, ≤ 0 in lines
+
+    # Variance metrics: total fraction of τ² explained, split evenly
+    total_var = float(np.sum(tau ** 2))
+    recon_err = float(np.linalg.norm(tau - W @ H, "fro") ** 2)
+    frac = max(0.0, 1.0 - recon_err / (total_var + eps))
+    var_ratio = np.full(K, frac / K)
+    cumvar = np.cumsum(var_ratio)
+
+    info = {"K": K, "evals": np.zeros(K), "var_ratio": var_ratio, "cumvar": cumvar}
+    return mu, Phi, info
+
+
+def build_telluric_nmf(loglam, flux, K, order=5, **kw):
+    """Thin wrapper: rectify ``flux`` then run :func:`build_nmf`.
+
+    Mirrors :func:`build_telluric_basis` but uses NMF instead of PCA.
+    Pass ``frame="observed"`` and ``params=None`` to :func:`save_basis`.
+    """
+    R, _ = rectify_grid(loglam, flux, order=order)
+    return build_nmf(R, K, **kw)
+
+
 def build_telluric_basis(loglam, flux, order=5, var_target=0.99, max_k=None, **clip_kw):
     """Build a telluric template basis from a grid of telluric models.
 

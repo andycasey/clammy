@@ -32,27 +32,33 @@ def _resolution_arg(args):
     return float(args.resolution) if args.resolution is not None else np.inf
 
 
+def _nmf_components_arg(args):
+    """Return the NMF K, or raise if --nmf-components was not supplied."""
+    if args.nmf_components is None:
+        raise SystemExit("--basis nmf requires --nmf-components K")
+    return int(args.nmf_components)
+
+
 def cmd_build(args):
-    if args.basis != "pca":
-        raise SystemExit(f"unknown --basis {args.basis!r} (only 'pca' is implemented)")
     resolution = _resolution_arg(args)
 
     if args.kind == "telluric":
-        # Telluric model grids carry no stellar labels, so use the
-        # label-agnostic loader and the (custom) glob pattern.
         loglam, flux, files = grid.load_spectra(args.templates, pattern=args.pattern)
         print(
             f"loaded {flux.shape[0]} telluric spectra x {flux.shape[1]} px "
             f"from {args.templates} (pattern {args.pattern!r})"
         )
-        mu, Phi, info = basis.build_telluric_basis(
-            loglam, flux, order=args.order, var_target=args.var, max_k=args.k_max
-        )
-        K = info["K"]
-        print(
-            f"PCA: kept K={K} components for "
-            f"{info['cumvar'][K - 1] * 100:.2f}% variance"
-        )
+        if args.basis == "nmf":
+            K = _nmf_components_arg(args)
+            mu, Phi, info = basis.build_telluric_nmf(loglam, flux, K, order=args.order)
+            tag = f"NMF K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
+        else:
+            mu, Phi, info = basis.build_telluric_basis(
+                loglam, flux, order=args.order, var_target=args.var, max_k=args.k_max
+            )
+            K = info["K"]
+            tag = f"PCA K={K}, {info['cumvar'][K - 1] * 100:.2f}% variance"
+        print(tag)
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         basis.save_basis(
             args.out,
@@ -69,19 +75,22 @@ def cmd_build(args):
             "NOTE: telluric basis built/stored in the OBSERVED (topocentric) "
             "frame -- it is NOT RV-shifted by `clammy fit`."
         )
-        print(
-            f"wrote telluric basis -> {args.out} "
-            f"(frame=observed, resolution={resolution})"
-        )
+        print(f"wrote telluric basis -> {args.out} (frame=observed, resolution={resolution})")
         return
 
-    # stellar (default): unchanged pipeline, now recording frame + resolution.
+    # stellar
     loglam, flux, params, files = grid.load_grid(args.templates)
     print(f"loaded {flux.shape[0]} spectra x {flux.shape[1]} px from {args.templates}")
     R, _ = basis.rectify_grid(loglam, flux, order=args.order)
-    mu, Phi, info = basis.build_pca(R, var_target=args.var, max_k=args.k_max)
-    K = info["K"]
-    print(f"PCA: kept K={K} components for {info['cumvar'][K - 1] * 100:.2f}% variance")
+    if args.basis == "nmf":
+        K = _nmf_components_arg(args)
+        mu, Phi, info = basis.build_nmf(R, K)
+        tag = f"NMF K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
+    else:
+        mu, Phi, info = basis.build_pca(R, var_target=args.var, max_k=args.k_max)
+        K = info["K"]
+        tag = f"PCA K={K}, {info['cumvar'][K - 1] * 100:.2f}% variance"
+    print(tag)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     basis.save_basis(
@@ -640,9 +649,16 @@ def build_parser():
         default="*.fits",
         help="glob pattern for --kind telluric (load_spectra; default *.fits)",
     )
-    pb.add_argument("--basis", default="pca", choices=["pca"], help="basis type")
-    pb.add_argument("--var", type=float, default=0.99, help="cumulative-variance target")
-    pb.add_argument("--k-max", type=int, default=None, help="cap on number of components")
+    pb.add_argument("--basis", default="pca", choices=["pca", "nmf"], help="basis type")
+    pb.add_argument("--var", type=float, default=0.99, help="cumulative-variance target (PCA)")
+    pb.add_argument("--k-max", type=int, default=None, help="cap on number of components (PCA)")
+    pb.add_argument(
+        "--nmf-components",
+        type=int,
+        default=None,
+        metavar="K",
+        help="number of NMF components (required when --basis nmf)",
+    )
     pb.add_argument("--order", type=int, default=5, help="rectification Legendre order")
     pb.add_argument(
         "--resolution",
