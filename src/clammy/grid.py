@@ -111,6 +111,39 @@ def _load_one_spectrum(path, wave_col, flux_col):
     return _col(wave_col), _col(flux_col)
 
 
+def _load_spectra_matrix(path, wave_col, flux_col):
+    """Load a whole grid from ONE file: ``(n_pix,)`` wave + ``(n_spec, n_pix)`` flux.
+
+    The natural single-file format for a model grid (e.g. a reconstructed telluric
+    spectrum set). ``.npz`` keys the arrays by ``wave_col``/``flux_col``; a FITS
+    table is read with the same columns. A 1-D flux (a single spectrum) is promoted
+    to one row, and a transposed ``(n_pix, n_spec)`` matrix is tolerated.
+    """
+    if str(path).endswith(".npz"):
+        with np.load(path, allow_pickle=False) as d:
+            w = np.asarray(d[wave_col], float)
+            fl = np.asarray(d[flux_col], float)
+    else:
+        t = Table.read(path)
+        wv = t[wave_col]
+        w = np.asarray(wv[0] if (len(t) == 1 and np.ndim(wv[0]) > 0) else wv, float)
+        fl = np.asarray(t[flux_col], float)
+    fl = np.atleast_2d(fl)
+    if fl.shape[1] != w.shape[0] and fl.shape[0] == w.shape[0]:
+        fl = fl.T  # tolerate a (n_pix, n_spec) matrix
+    if fl.shape[1] != w.shape[0]:
+        raise ValueError(
+            f"{path}: flux shape {fl.shape} is incompatible with wave {w.shape}"
+        )
+    if not np.all(np.isfinite(fl)) or np.any(fl <= 0.0):
+        raise ValueError(
+            f"{path}: flux must be finite and strictly positive for the "
+            "log-rectification step (got non-positive or non-finite values)"
+        )
+    files = [f"{os.path.basename(path)}[{i}]" for i in range(fl.shape[0])]
+    return w, fl, files
+
+
 def load_spectra(templ_dir=".", pattern="*.fits", wave_col="wave", flux_col="flux"):
     """Load an unlabelled grid of spectra onto a shared log-lambda grid.
 
@@ -150,6 +183,13 @@ def load_spectra(templ_dir=".", pattern="*.fits", wave_col="wave", flux_col="flu
     arrays are returned -- pass ``params=None`` to ``basis.save_basis`` for an
     unlabelled (telluric) basis.
     """
+    # A single multi-spectrum file (an .npz/FITS holding a (n_spec, n_pix) flux
+    # matrix plus a (n_pix,) wavelength array) is accepted directly: the natural
+    # one-file format for a model grid such as a reconstructed telluric spectrum
+    # set, avoiding an explosion into thousands of per-spectrum files.
+    if os.path.isfile(templ_dir):
+        return _load_spectra_matrix(templ_dir, wave_col, flux_col)
+
     files_full = sorted(glob.glob(os.path.join(templ_dir, pattern)))
     if not files_full:
         raise FileNotFoundError(f"no files matching {pattern!r} in {templ_dir!r}")
