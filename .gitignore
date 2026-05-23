@@ -1,0 +1,22 @@
+# Python / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+
+# macOS
+.DS_Store
+
+# large data + generated artifacts (regenerate with the scripts / CLI)
+grid/original/
+grid/convolved/
+outputs/*.npz
+docs/*.aux
+docs/*.log
+docs/*.out
+
+output/
+dmost/
