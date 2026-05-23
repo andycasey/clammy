@@ -231,6 +231,7 @@ def cmd_fit(args):
         R_native_star=R_native_star,
         R_native_tell=R_native_tell,
         tell_basis=tell_basis,
+        fit_telluric_shift=args.fit_telluric_shift,
         vsini=args.vsini,
         fit_vsini=args.fit_vsini,
         vsini_bounds=tuple(args.vsini_bounds),
@@ -255,6 +256,13 @@ def cmd_fit(args):
             print(f"vsini    = {res['vsini_kms']:.2f} +/- {res['vsini_err_kms']:.2f} km/s")
     elif args.vsini is not None:
         print(f"vsini    = {res['vsini_kms']:.2f} km/s   (fixed)")
+    if args.fit_telluric_shift:
+        print(f"v_tell   = {res['v_tell_kms']:+.3f} +/- {res['v_tell_err_kms']:.3f} km/s   (telluric wavelength zero-point)")
+        print(f"v_corr   = {res['v_corr_kms']:+.3f} +/- {res['v_corr_err_kms']:.3f} km/s   (zero-point-corrected RV)")
+    if args.vbary is not None:
+        _base = res.get("v_corr_kms", res["v_kms"])
+        _lbl = "barycentric+telluric" if "v_corr_kms" in res else "barycentric"
+        print(f"v_final  = {_base + args.vbary:+.3f} km/s   ({_lbl}-corrected; vbary={args.vbary:+.3f})")
     print(
         f"chi2/dof = {res['chi2_dof']:.3f}   "
         f"(chi2={res['chi2']:.1f}, dof={res['dof']}, n={res['n_good']})"
@@ -290,46 +298,144 @@ def cmd_fit(args):
             )
         elif args.vsini is not None:
             payload["vsini_kms"] = res["vsini_kms"]
+        if args.fit_telluric_shift:
+            payload.update(
+                v_tell_kms=res["v_tell_kms"],
+                v_tell_err_kms=res["v_tell_err_kms"],
+                v_corr_kms=res["v_corr_kms"],
+                v_corr_err_kms=res["v_corr_err_kms"],
+            )
         if "u" in res:
             payload["u"] = res["u"].tolist()
         with open(args.out, "w") as fh:
             json.dump(payload, fh, indent=2)
         print(f"wrote results -> {args.out}")
 
+    ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
     if args.plot:
-        _plot_fit(loglam_b, flux, res, args.plot)
+        _plot_fit(loglam_b, flux, sigma, res, args.plot,
+                  source=os.path.basename(args.spectrum_file), ref=ref, vbary=args.vbary)
         print(f"wrote plot -> {args.plot}")
 
+    if args.scan_plot:
+        _plot_scan(res, args.scan_plot, source=os.path.basename(args.spectrum_file))
+        print(f"wrote scan plot -> {args.scan_plot}")
 
-def _plot_fit(loglam, flux, res, path):
+
+def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     lam = np.exp(loglam)
-    sl = slice(0, len(lam), max(1, len(lam) // 4000))
+    sl = slice(0, len(lam), max(1, len(lam) // 12000))
     fig, ax = plt.subplots(
         2,
         1,
-        figsize=(12, 6),
+        figsize=(33, 7),
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
-    ax[0].plot(lam[sl], flux[sl], lw=0.4, color="0.5", label="data")
-    ax[0].plot(lam[sl], res["model"][sl], lw=0.5, color="C3", label="model")
-    title = f"v={res['v_kms']:.2f} km/s, chi2/dof={res['chi2_dof']:.2f}"
+    ax[0].plot(lam[sl], flux[sl], lw=0.4, color="black", label="data")
+    ax[0].plot(lam[sl], res["model"][sl], lw=0.5, color="tab:red", label="model")
+    # the fitted Legendre continuum (smooth, multiplicative): exp(P . c) in linear flux
+    cont = np.exp(np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
+    ax[0].plot(lam[sl], cont[sl], lw=1.0, color="tab:orange", ls=":", label="continuum")
+    # restrict both panels to where there is real (in-coverage, finite) data; the
+    # resampled data is edge-clamped (finite) outside coverage, so use the `good` mask.
+    valid = np.isfinite(flux)
+    good = res.get("good")
+    if good is not None:
+        valid &= np.asarray(good, bool)
+    if valid.any():
+        lam_v = lam[valid]
+        ax[0].set_xlim(lam_v.min(), lam_v.max())  # sharex -> applies to both panels
+        lo, hi = np.percentile(flux[valid], [1, 99])
+        margin = 0.10 * (hi - lo)
+        ax[0].set_ylim(0.0, hi + margin)  # floor at 0, keep the (1-99 pctile + 10%) max
+    # title: the RV chain raw -> telluric-zero-point-corrected -> +barycentric, then
+    # R/vsini/chi2 and an optional external reference velocity (e.g. the Geha value).
+    title = f"v={res['v_kms']:+.2f}"
+    base = res["v_kms"]
+    if "v_corr_kms" in res:
+        title += f" -> tell-corr {res['v_corr_kms']:+.2f}"
+        base = res["v_corr_kms"]
+    if vbary is not None:
+        lbl = "bary+tell" if "v_corr_kms" in res else "bary"
+        title += f" -> {lbl} {base + vbary:+.2f}"
+    title += " km/s"
     if "rho_vR" in res:
         title += f", R={res['resolution_R']:.0f}"
     if "vsini_kms" in res:
         title += f", vsini={res['vsini_kms']:.1f}"
-    ax[0].set_title(title)
+    title += f", chi2/dof={res['chi2_dof']:.2f}"
+    if ref is not None:
+        rv, rverr, rname = ref
+        title += f"   |   {rname} v={rv:+.2f}"
+        if rverr is not None:
+            title += f"$\\pm${rverr:.2f}"
+        title += " km/s"
+    ax[0].set_title((f"{source}\n" if source else "") + title)
     ax[0].set_ylabel("flux")
     ax[0].legend()
-    ax[1].plot(lam[sl], res["resid_lnd"][sl], lw=0.4)
+    # we fit in log-flux, but show the linear-flux chi residual (data - model)/sigma
+    chi = (flux - res["model"]) / sigma
+    if good is not None:
+        chi = np.where(np.asarray(good, bool), chi, np.nan)
+    ax[1].plot(lam[sl], chi[sl], lw=0.4, color="0.3")
     ax[1].axhline(0, color="k", lw=0.5)
-    ax[1].set_ylabel("ln-flux resid")
+    ax[1].axhline(3, color="k", lw=0.5, ls="--")
+    ax[1].axhline(-3, color="k", lw=0.5, ls="--")
+    ax[1].set_ylim(-5, 5)
+    ax[1].set_ylabel("(flux - model) / sigma")
     ax[1].set_xlabel("wavelength [A]")
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+
+def _plot_scan(res, path, source=None):
+    """Coarse-scan profiled chi2: chi2(v, R) when R was fit, else chi2(v)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    v = np.asarray(res["v_grid"], float)
+    if "chi2_2d" in res and "R_grid" in res:
+        chi2 = np.asarray(res["chi2_2d"], float)  # (n_sp, S); row 0 = no broadening
+        Rg = np.asarray(res["R_grid"], float)  # (n_sp-1,), aligned with rows 1:
+        dchi = chi2 - np.nanmin(chi2)
+        fig, ax = plt.subplots(
+            2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [1, 2]}
+        )
+        ax[0].plot(v, dchi.min(axis=0), lw=0.8, color="0.2")
+        ax[0].axvline(res["v_kms"], color="C3", lw=0.8)
+        ax[0].set_ylabel(r"$\Delta\chi^2$ (profiled over R)")
+        from matplotlib.colors import LogNorm
+
+        d2 = np.clip(dchi[1:], 1.0, None)  # color by log of Delta-chi2 (compress range)
+        pm = ax[1].pcolormesh(
+            v, Rg, d2, shading="auto", cmap="viridis",
+            norm=LogNorm(vmin=1.0, vmax=max(10.0, float(np.nanmax(d2)))),
+        )
+        ax[1].plot(res["v_kms"], res["resolution_R"], "x", color="tab:red", ms=10, mew=2)
+        ax[1].set_ylabel("R")
+        ax[1].set_xlabel("v [km/s]")
+        fig.colorbar(pm, ax=ax[1], label=r"$\Delta\chi^2$ (log scale)")
+        title = f"chi2(v, R) scan: v={res['v_kms']:.2f} km/s, R={res['resolution_R']:.0f}"
+    else:
+        dchi = np.asarray(res["chi2_grid"], float)
+        dchi = dchi - np.nanmin(dchi)
+        fig, axx = plt.subplots(figsize=(10, 4))
+        axx.plot(v, dchi, lw=0.8, color="0.2")
+        axx.axvline(res["v_kms"], color="C3", lw=0.8)
+        axx.set_xlabel("v [km/s]")
+        axx.set_ylabel(r"$\Delta\chi^2$")
+        ax = [axx]
+        title = f"chi2(v) scan: v={res['v_kms']:.2f} km/s"
+    ax[0].set_title((f"{source}\n" if source else "") + title)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
@@ -420,6 +526,12 @@ def build_parser():
         "`clammy build --kind telluric`); adds telluric columns that are NOT "
         "RV-shifted, resampled onto the fitting grid if needed",
     )
+    pf.add_argument(
+        "--fit-telluric-shift",
+        action="store_true",
+        help="also fit a velocity shift of the telluric block (the instrument "
+        "wavelength zero-point); reports v_tell and the zero-point-corrected v_corr",
+    )
     pf.add_argument("--cont-order", type=int, default=3, help="Legendre continuum order")
     pf.add_argument("--vmin", type=float, default=-500.0, help="RV search min [km/s]")
     pf.add_argument("--vmax", type=float, default=500.0, help="RV search max [km/s]")
@@ -498,6 +610,14 @@ def build_parser():
     )
     pf.add_argument("--out", "-o", default=None, help="write results JSON")
     pf.add_argument("--plot", default=None, help="write a data/model/residual plot")
+    pf.add_argument("--scan-plot", default=None,
+                    help="write the coarse-scan chi2 surface: chi2(v, R) if --fit-resolution, else chi2(v)")
+    pf.add_argument("--ref-v", type=float, default=None,
+                    help="reference RV [km/s] to show in the plot title (e.g. a catalog value)")
+    pf.add_argument("--ref-v-err", type=float, default=None, help="uncertainty on --ref-v [km/s]")
+    pf.add_argument("--ref-name", default="ref", help="label for --ref-v in the plot title")
+    pf.add_argument("--vbary", type=float, default=None,
+                    help="barycentric velocity correction [km/s] to add to the (telluric-)corrected RV in the title/report")
     pf.set_defaults(func=cmd_fit)
 
     return p
