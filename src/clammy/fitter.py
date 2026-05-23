@@ -353,6 +353,7 @@ def fit_rv(
     n_conv_iter=0,
     nnls_stellar=False,
     nnls_telluric=False,
+    weight_scheme="snr2",
 ):
     """Fit radial velocity (+ optional resolution, vsini, tellurics), weights, continuum.
 
@@ -506,7 +507,16 @@ def fit_rv(
     good[-n_max:] = False
     lnd = np.where(good, np.log(np.where(d > 0, d, 1.0)), 0.0)
     W = np.zeros(n)
-    W[good] = (d[good] / sigma[good]) ** 2
+    if weight_scheme == "ivar":
+        # Equal-weight log-flux: W = (d_cont / sigma)^2 where d_cont is the
+        # 95th-percentile flux (a continuum proxy, constant per spectrum).
+        # All pixels -- including deep absorption cores -- get the same weight
+        # scale as continuum pixels.  With snr2 (the default), W = (d/sigma)^2
+        # goes to zero in the cores (d -> 0) and they are effectively ignored.
+        d_cont = np.percentile(d[good], 95)
+        W[good] = (d_cont / sigma[good]) ** 2
+    else:  # "snr2" (default): delta-method log-flux weights
+        W[good] = (d[good] / sigma[good]) ** 2
 
     # --- design blocks ----------------------------------------------------------
     T = np.vstack([mu, Phi]).T

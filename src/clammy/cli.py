@@ -380,6 +380,7 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         n_conv_iter=args.conv_iter,
         nnls_stellar=nnls_stellar,
         nnls_telluric=nnls_telluric,
+        weight_scheme=args.weight_scheme,
     )
     res = fitter.fit_rv(flux, sigma, loglam_b, mu, Phi, **fit_kwargs)
     if args.rescale_errors:
@@ -817,6 +818,14 @@ def build_parser():
     pf.add_argument("--conv-iter", type=int, default=0, metavar="N",
                     help="iterate the EXACT linear-flux convolution N times to fix deep line "
                     "cores (0=off, fast log-space approx; ~8-12 converges). Unbiases R.")
+    pf.add_argument("--weight", default="snr2", choices=["snr2", "ivar"],
+                    dest="weight_scheme",
+                    help="pixel weighting in log-flux space. 'snr2' (default): W = (d/sigma)^2 "
+                    "= SNR^2 -- the delta-method log-flux weight; down-weights deep absorption "
+                    "cores by d^2 so they are nearly ignored. 'ivar': W = (d_cont/sigma)^2 "
+                    "where d_cont is the 95th-percentile flux (continuum proxy) -- all pixels "
+                    "get the same weight scale regardless of local flux; use when sigma is "
+                    "read-noise dominated and you want the cores to influence the fit equally.")
     pf.set_defaults(func=cmd_fit)
 
     return p
