@@ -97,6 +97,10 @@ $P_m$                & vector    & $m$-th Legendre continuum column, $m=0,\dots,
 $\mathbf{P}$         & $n\times(L{+}1)$ & continuum design block \\
 $L$                  & scalar    & continuum (Legendre) order \\
 $\mathbf{c}=(c_0,\dots,c_L)$ & vector & continuum coefficients \\[2pt]
+$\tau_i = -Y_i^+$    & vector    & non-negative optical depth, $\tau_i=\max(-Y_i,0)$, used in NMF training \\
+$\boldsymbol\tau$    & $n_{\rm spec}\times n_{\rm pix}$ & optical-depth matrix of the training library \\
+$\mathbf{W}_{\rm NMF}$ & $n_{\rm spec}\times K$ & NMF activation matrix (training, $\geq 0$) \\
+$\mathbf{H}_{\rm NMF}$ & $K\times n_{\rm pix}$ & NMF component matrix (training, $\geq 0$) \\[2pt]
 $S_j,\;\mathbf{S}$   & vector, $n\times(J{+}1)$ & telluric templates / block (observed frame, not RV-shifted) \\
 $\mathbf{u}=(u_0,\dots,u_J)$ & vector & telluric weights \\
 $p_{\rm tell}$       & pixels    & telluric lag (instrument wavelength zero-point) \\[2pt]
@@ -208,6 +212,110 @@ collinear components or too few good pixels), the solve is regularised: a Tikhon
 ridge $\mathbf{N}\!\to\!\mathbf{N}+\rho\mathbf{I}$, a truncated SVD, or a
 non-negativity constraint (NNLS) when physical positivity of the weights is
 desired.
+
+% ============================================================================
+\section{Template basis: PCA versus NMF}
+\label{sec:basis}
+% ============================================================================
+The template columns $T_k$ in \eqref{eq:linmodel} can be constructed from a
+training library by two methods: PCA or NMF. Both operate on the
+$n_{\rm spec}\times n_{\rm pix}$ rectified log-flux matrix $\mathbf{R}$, whose rows
+are training spectra after continuum removal. At test time the same separable
+machinery is used regardless of which basis was chosen; the difference lies entirely
+in how the basis vectors are built and in the constraint placed on the weights at
+the final solve.
+
+\subsection*{PCA basis}
+
+PCA finds the $K$-dimensional affine subspace of minimum weighted reconstruction
+error. The sample mean $\mu$ is computed and subtracted; a truncated SVD of the
+mean-centred matrix yields $K$ orthonormal components $\phi_k$ and their associated
+eigenvalues $\lambda_k$ (one per component), ordered by decreasing explained
+variance. At test time the weight vector $\mathbf{w}$ is solved by unconstrained
+weighted least squares \eqref{eq:normaleq}; each $w_k$ is free to be positive or
+negative.
+
+\subsection*{NMF basis}
+
+NMF exploits the sign structure of absorption spectra. Because rectified log-flux is
+non-positive wherever stellar opacity is nonzero ($Y_i \leq 0$ in the lines), we
+define the non-negative optical-depth matrix
+\begin{equation}
+  \tau_{si} \;=\; \max(-R_{si},\,0) \;\geq\; 0
+\end{equation}
+and factorise it as
+\begin{equation}
+  \boldsymbol\tau \;\approx\; \mathbf{W}_{\rm NMF}\,\mathbf{H}_{\rm NMF},
+  \qquad
+  \mathbf{W}_{\rm NMF} \in \mathbb{R}^{n_{\rm spec}\times K}_{\geq 0},
+  \quad
+  \mathbf{H}_{\rm NMF} \in \mathbb{R}^{K\times n_{\rm pix}}_{\geq 0},
+  \label{eq:nmffac}
+\end{equation}
+minimising $\|\boldsymbol\tau - \mathbf{W}_{\rm NMF}\mathbf{H}_{\rm NMF}\|_F^2$
+over non-negative factors by Lee--Seung multiplicative updates
+\citep*{LeeSeung1999}, initialised with the non-negative double SVD (NNDSVD) of
+\citet*{BoutsidisGallopoulos2008}. Each row $(\mathbf{H}_{\rm NMF})_k$ is a
+non-negative optical-depth component; we negate and $\ell_2$-normalise to match the
+PCA column convention,
+\begin{equation}
+  \phi_k^{\rm NMF} \;=\; -\,\frac{(\mathbf{H}_{\rm NMF})_k}{\|(\mathbf{H}_{\rm NMF})_k\|_2}
+  \;\leq\; 0,
+  \label{eq:nmfphi}
+\end{equation}
+producing non-positive templates that are zero in the continuum and negative in
+the line cores, matching the convention of the PCA components exactly. The
+resulting $(\mu, \{\phi_k^{\rm NMF}\})$ pair is a drop-in replacement for the PCA
+basis in all downstream machinery.
+
+\paragraph{Test-time inference with bounded least squares.}
+The separable velocity scan and Newton refinement of
+Sections~\ref{sec:fft}--\ref{sec:opt} proceed identically for NMF bases, because
+the outer nonlinear scan and the inner linear solve are independent of how the
+template columns were constructed. Non-negativity of the weights is enforced in a
+\emph{post-refinement} step: once the nonlinear parameters $(v, R, p_{\rm tell})$
+are fixed at their Newton optimum, the full linear weight vector $\boldsymbol\theta$
+is re-solved under the bounded system
+\begin{equation}
+  \widehat{\boldsymbol\theta} \;=\; \argmin_{\boldsymbol\theta}\;
+  \|\sqrt{\mathbf{C}^{-1}}\,(\mathbf{A}\,\boldsymbol\theta - \mathbf{Y})\|^2
+  \quad\text{s.t.}\quad
+  w_k \geq 0\;\;(k=0,\dots,K),\quad c_m \in \mathbb{R},
+  \label{eq:bvls}
+\end{equation}
+solved by bounded-variable least squares (BVLS, \texttt{scipy.optimize.lsq\_linear})
+with lower bounds $\ell_k=0$ on the template columns and $\ell_m=-\infty$ on the
+continuum columns. The continuum coefficients remain unconstrained because the
+Legendre polynomials carry no physical sign requirement. Any ridge penalty is
+absorbed into the augmented system before the BVLS call. The post-step recomputes
+$\chi^2$ so that the reported goodness-of-fit reflects the constrained solution.
+
+\subsection*{Comparison}
+
+\paragraph{PCA: optimal compression, unconstrained weights.}
+For a given $K$, PCA minimises the reconstruction error over \emph{all}
+$K$-dimensional subspaces, so it is the optimal linear compressor --- no other
+$K$-component basis captures more variance from the training library. The
+unconstrained WLS inner solve is exact and closed-form. However, because the
+weights $w_k$ are free, the reconstructed rectified log-flux
+$\hat{M}(x) = \sum_k w_k\phi_k(x)$ can be \emph{positive}: in linear flux this
+corresponds to $e^{\hat{M}} > 1$, i.e.\ the model spectrum exceeds the continuum.
+For a purely absorbing stellar atmosphere this is unphysical (emission is not
+modelled), so the positivity excursions are an artefact of the unconstrained
+weights acting on a non-orthogonal projection of the data.
+
+\paragraph{NMF: physical bounds, sub-optimal compression.}
+Because the NMF components $\phi_k^{\rm NMF}$ are non-positive and the weights are
+constrained to $w_k \geq 0$, the reconstructed log-flux
+$\sum_k w_k\phi_k^{\rm NMF} \leq 0$ everywhere, and the corresponding linear-flux
+rectified spectrum lies in $(0,1]$: strictly between zero (total opacity) and the
+continuum (no absorption). The model is therefore physically consistent by
+construction. The cost is compression efficiency: the non-negativity constraint
+restricts the feasible basis, so NMF requires more components than PCA to capture
+the same fraction of variance, and the BVLS post-step is slower than the
+closed-form WLS solve. The components are also no longer orthogonal
+($\mathbf{M}_{TT}$ is generally denser), though this does not affect the
+correctness of the separable framework.
 
 % ============================================================================
 \section{Radial velocity as translation: the per-shift linear solve}
@@ -674,6 +782,14 @@ parameters: the RV shift $p$, plus optionally the resolution $\sigma_{\rm pix}$,
 rotation $v\sin i$, and the telluric shift $p_{\rm tell}$.
 
 \begin{thebibliography}{9}
+\bibitem[Boutsidis \& Gallopoulos(2008)]{BoutsidisGallopoulos2008}
+  Boutsidis, C., \& Gallopoulos, E.\ 2008,
+  ``SVD based initialization: A head start for nonneg\-ative matrix factorization,''
+  Pattern Recognition, 41, 1350.
+\bibitem[Lee \& Seung(1999)]{LeeSeung1999}
+  Lee, D.~D., \& Seung, H.~S.\ 1999,
+  ``Learning the parts of objects by non-negative matrix factorization,''
+  Nature, 401, 788.
 \bibitem[Bolton et al.(2012)]{Bolton2012}
   Bolton, A.~S., Schlegel, D.~J., Aubourg, \'E., et al.\ 2012,
   ``Spectral Classification and Redshift Measurement for the SDSS-III

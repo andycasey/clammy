@@ -52,6 +52,10 @@ def cmd_build(args):
             K = _nmf_components_arg(args)
             mu, Phi, info = basis.build_telluric_nmf(loglam, flux, K, order=args.order)
             tag = f"NMF K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
+        elif args.basis == "nmf_linear":
+            K = _nmf_components_arg(args)
+            mu, Phi, info = basis.build_telluric_nmf_linear(loglam, flux, K, order=args.order)
+            tag = f"NMF-linear K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
         else:
             mu, Phi, info = basis.build_telluric_basis(
                 loglam, flux, order=args.order, var_target=args.var, max_k=args.k_max
@@ -82,15 +86,21 @@ def cmd_build(args):
     # stellar
     loglam, flux, params, files = grid.load_grid(args.templates)
     print(f"loaded {flux.shape[0]} spectra x {flux.shape[1]} px from {args.templates}")
-    R, _ = basis.rectify_grid(loglam, flux, order=args.order)
-    if args.basis == "nmf":
+    if args.basis == "nmf_linear":
         K = _nmf_components_arg(args)
-        mu, Phi, info = basis.build_nmf(R, K)
-        tag = f"NMF K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
+        mu, Phi, info = basis.build_nmf_linear(
+            basis.rectify_linear(loglam, flux, order=args.order), K)
+        tag = f"NMF-linear K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
     else:
-        mu, Phi, info = basis.build_pca(R, var_target=args.var, max_k=args.k_max)
-        K = info["K"]
-        tag = f"PCA K={K}, {info['cumvar'][K - 1] * 100:.2f}% variance"
+        R, _ = basis.rectify_grid(loglam, flux, order=args.order)
+        if args.basis == "nmf":
+            K = _nmf_components_arg(args)
+            mu, Phi, info = basis.build_nmf(R, K)
+            tag = f"NMF K={info['K']}, {info['cumvar'][-1] * 100:.2f}% variance"
+        else:
+            mu, Phi, info = basis.build_pca(R, var_target=args.var, max_k=args.k_max)
+            K = info["K"]
+            tag = f"PCA K={K}, {info['cumvar'][K - 1] * 100:.2f}% variance"
     print(tag)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
@@ -293,7 +303,9 @@ def cmd_fit(args):
     b = basis.load_basis(args.basis_file)
     loglam_b, mu, Phi = b["loglam"], b["mu"], b["Phi"]
     R_native_star = float(b["resolution"])
-    nnls_stellar = (b.get("method", "pca") == "nmf")
+    star_method = b.get("method", "pca")
+    nnls_stellar = star_method in ("nmf", "nmf_linear")
+    domain = "linear" if star_method == "nmf_linear" else "log"
 
     tell_basis = None
     R_native_tell = np.inf
@@ -303,13 +315,17 @@ def cmd_fit(args):
             args.telluric_basis, np.asarray(loglam_b, float)
         )
         tell_basis = (tell_mu, tell_Phi)
-        nnls_telluric = (tell_method == "nmf")
+        nnls_telluric = tell_method in ("nmf", "nmf_linear")
+        if tell_method == "nmf_linear" and domain == "log":
+            domain = "linear"
 
     if nnls_stellar or nnls_telluric:
         which = " + ".join(
             (["stellar"] if nnls_stellar else []) + (["telluric"] if nnls_telluric else [])
         )
         print(f"NMF basis detected ({which}): weights will be non-negative (NNLS post-refine).")
+    if domain == "linear":
+        print("linear-flux domain: fitting d directly (additive continuum, ivar weights).")
 
     ref = (args.ref_v, args.ref_v_err, args.ref_name) if args.ref_v is not None else None
 
@@ -319,7 +335,8 @@ def cmd_fit(args):
         try:
             _fit_one(path, args, loglam_b, mu, Phi, R_native_star,
                      tell_basis, R_native_tell, ref,
-                     nnls_stellar=nnls_stellar, nnls_telluric=nnls_telluric)
+                     nnls_stellar=nnls_stellar, nnls_telluric=nnls_telluric,
+                     domain=domain)
         except Exception as exc:  # don't let one bad spectrum abort a batch
             if len(paths) == 1:
                 raise
@@ -327,7 +344,7 @@ def cmd_fit(args):
 
 
 def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_tell, ref,
-             nnls_stellar=False, nnls_telluric=False):
+             nnls_stellar=False, nnls_telluric=False, domain="log"):
     """Fit one spectrum and write its report, JSON, and plots."""
     loglam_o, flux_o, sigma_o, good_o = read_spectrum(
         path,
@@ -381,6 +398,7 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         nnls_stellar=nnls_stellar,
         nnls_telluric=nnls_telluric,
         weight_scheme=args.weight_scheme,
+        domain=domain,
     )
     res = fitter.fit_rv(flux, sigma, loglam_b, mu, Phi, **fit_kwargs)
     if args.rescale_errors:
@@ -496,21 +514,36 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
         gridspec_kw={"height_ratios": [3, 1]},
     )
     ax[0].plot(lam[sl], flux[sl], lw=0.4, color="black", label="data")
-    # decompose the (multiplicative) model: continuum, and the stellar / telluric
-    # absorption each applied ON the continuum. ln_cont/ln_star/ln_tell come from the
-    # fitter; fall back to recomputing the continuum from c if absent.
-    cont_ln = (np.asarray(res["ln_cont"]) if "ln_cont" in res
-               else np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
-    if "ln_tell" in res:
-        ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_tell"]) + cont_ln)[sl],
-                   lw=0.6, color="tab:blue", label="telluric × continuum")
-    if "ln_star" in res:
-        ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_star"]) + cont_ln)[sl],
-                   lw=0.6, color="tab:red", label="stellar × continuum")
+    # decompose the model into components and continuum.
+    # Linear-flux mode (additive): star_flux/tell_flux/cont_flux are raw linear arrays.
+    # Log-flux mode (multiplicative): use ln_* and exponentiate with continuum.
+    if "star_flux" in res:
+        # Linear-flux additive model: model = star_flux + tell_flux + cont_flux.
+        # The TOTAL model is the headline (it should overlay the data); the blocks
+        # are the actual additive contributions (NOT "x * continuum" as in log-flux,
+        # so we plot them as-is rather than exponentiating onto a continuum).
+        cont_fl = np.asarray(res["cont_flux"])
+        ax[0].plot(lam[sl], res["model"][sl], lw=0.7, color="tab:red", label="model")
+        if "tell_flux" in res:
+            ax[0].plot(lam[sl], np.asarray(res["tell_flux"])[sl],
+                       lw=0.5, color="tab:blue", label="telluric block")
+        ax[0].plot(lam[sl], np.asarray(res["star_flux"])[sl],
+                   lw=0.5, color="tab:green", label="stellar block")
+        ax[0].plot(lam[sl], cont_fl[sl], lw=1.0, color="tab:orange", ls="--",
+                   label="continuum")
     else:
-        ax[0].plot(lam[sl], res["model"][sl], lw=0.6, color="tab:red", label="model")
-    ax[0].plot(lam[sl], np.exp(cont_ln)[sl], lw=1.0, color="tab:orange", ls="--",
-               label="continuum")
+        cont_ln = (np.asarray(res["ln_cont"]) if "ln_cont" in res
+                   else np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
+        if "ln_tell" in res:
+            ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_tell"]) + cont_ln)[sl],
+                       lw=0.6, color="tab:blue", label="telluric × continuum")
+        if "ln_star" in res:
+            ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_star"]) + cont_ln)[sl],
+                       lw=0.6, color="tab:red", label="stellar × continuum")
+        else:
+            ax[0].plot(lam[sl], res["model"][sl], lw=0.6, color="tab:red", label="model")
+        ax[0].plot(lam[sl], np.exp(cont_ln)[sl], lw=1.0, color="tab:orange", ls="--",
+                   label="continuum")
     # restrict both panels to where there is real (in-coverage, finite) data; the
     # resampled data is edge-clamped (finite) outside coverage, so use the `good` mask.
     valid = np.isfinite(flux)
@@ -665,7 +698,9 @@ def build_parser():
         default="*.fits",
         help="glob pattern for --kind telluric (load_spectra; default *.fits)",
     )
-    pb.add_argument("--basis", default="pca", choices=["pca", "nmf"], help="basis type")
+    pb.add_argument("--basis", default="pca", choices=["pca", "nmf", "nmf_linear"],
+                    help="basis type: pca (log-flux PCA), nmf (log-flux NMF on optical depth), "
+                    "nmf_linear (linear-flux NMF on normalized spectra)")
     pb.add_argument("--var", type=float, default=0.99, help="cumulative-variance target (PCA)")
     pb.add_argument("--k-max", type=int, default=None, help="cap on number of components (PCA)")
     pb.add_argument(

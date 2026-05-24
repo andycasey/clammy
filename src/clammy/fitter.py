@@ -354,6 +354,7 @@ def fit_rv(
     nnls_stellar=False,
     nnls_telluric=False,
     weight_scheme="snr2",
+    domain="log",
 ):
     """Fit radial velocity (+ optional resolution, vsini, tellurics), weights, continuum.
 
@@ -499,24 +500,31 @@ def fit_rv(
     p_hi = int(np.ceil(np.log1p(vmax / C_LIGHT_KMS) / dln))
     n_max = max(abs(p_lo), abs(p_hi)) + 4
 
-    # --- weights on ln d, with edge + bad-pixel masking ------------------------
-    good = np.isfinite(d) & np.isfinite(sigma) & (d > 0) & (sigma > 0)
+    # --- weights and data vector, with edge + bad-pixel masking ----------------
+    # In "log" domain: fit ln(d) with delta-method weights W = (d/sigma)^2.
+    # In "linear" domain: fit d directly with correct ivar weights W = 1/sigma^2;
+    #   d>0 is not required (sky-subtracted pixels can be slightly negative).
+    _require_pos = (domain == "log")
+    good = np.isfinite(d) & np.isfinite(sigma) & (sigma > 0)
+    if _require_pos:
+        good &= (d > 0)
     if mask is not None:
         good &= np.asarray(mask, bool)
     good[:n_max] = False
     good[-n_max:] = False
-    lnd = np.where(good, np.log(np.where(d > 0, d, 1.0)), 0.0)
-    W = np.zeros(n)
-    if weight_scheme == "ivar":
-        # Equal-weight log-flux: W = (d_cont / sigma)^2 where d_cont is the
-        # 95th-percentile flux (a continuum proxy, constant per spectrum).
-        # All pixels -- including deep absorption cores -- get the same weight
-        # scale as continuum pixels.  With snr2 (the default), W = (d/sigma)^2
-        # goes to zero in the cores (d -> 0) and they are effectively ignored.
-        d_cont = np.percentile(d[good], 95)
-        W[good] = (d_cont / sigma[good]) ** 2
-    else:  # "snr2" (default): delta-method log-flux weights
-        W[good] = (d[good] / sigma[good]) ** 2
+
+    if domain == "linear":
+        lnd = np.where(good, d, 0.0)            # lnd holds d in linear mode
+        W = np.zeros(n)
+        W[good] = 1.0 / sigma[good] ** 2        # exact ivar
+    else:
+        lnd = np.where(good, np.log(np.where(d > 0, d, 1.0)), 0.0)
+        W = np.zeros(n)
+        if weight_scheme == "ivar":
+            d_cont = np.percentile(d[good], 95)
+            W[good] = (d_cont / sigma[good]) ** 2
+        else:
+            W[good] = (d[good] / sigma[good]) ** 2
 
     # --- design blocks ----------------------------------------------------------
     T = np.vstack([mu, Phi]).T
@@ -840,7 +848,7 @@ def fit_rv(
     # delta. Stop after n_conv_iter iters or when delta stops changing.
     delta_star = delta_tell = None        # block corrections (None until computed)
     E_star_block = E_tell_block = None     # exact broadened blocks for reporting
-    if n_conv_iter >= 1:
+    if domain == "log" and n_conv_iter >= 1:
         x_prev = np.asarray(x_star, float)
         for _it in range(int(n_conv_iter)):
             # delta from the CURRENT solution (its nonlinear params + theta).
@@ -1110,7 +1118,28 @@ def fit_rv(
 
     if return_model:
         A_np = np.asarray(A)
-        if delta_star is None:
+        if domain == "linear":
+            # Linear-flux fit: model = A @ theta directly.
+            # Store raw linear components (not log-transformed) so the plotter
+            # can draw the additive decomposition without exp(log(negative)) → 0.
+            model = A_np @ theta
+            star_flux = A_np[:, :Ktot] @ theta[:Ktot]
+            cont_flux = A_np[:, Ktot + J_tell:] @ theta[Ktot + J_tell:]
+            out["model"] = model
+            out["lnd"] = np.log(np.maximum(d, 1e-300))
+            out["ln_model"] = np.log(np.maximum(model, 1e-300))
+            out["resid_lnd"] = np.where(good, (d - model) / sigma, np.nan)
+            out["good"] = good
+            out["star_flux"] = star_flux
+            out["cont_flux"] = cont_flux
+            # ln_* kept for compatibility (e.g. title formatting); use star/tell/cont_flux for plotting.
+            out["ln_star"] = np.log(np.maximum(star_flux, 1e-300))
+            out["ln_cont"] = np.log(np.maximum(cont_flux, 1e-300))
+            if J_tell:
+                tell_flux = A_np[:, Ktot:Ktot + J_tell] @ theta[Ktot:Ktot + J_tell]
+                out["tell_flux"] = tell_flux
+                out["ln_tell"] = np.log(np.maximum(tell_flux, 1e-300))
+        elif delta_star is None:
             # n_conv_iter = 0: the historical log-space-broadened model (unchanged).
             ln_model = A_np @ theta
             out["ln_model"] = ln_model

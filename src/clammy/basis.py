@@ -164,21 +164,35 @@ def build_nmf(R, K, max_iter=500, tol=1e-4, random_state=0):
     Phi    : (K, n_pix)  unit-norm NMF absorption templates in log-flux space
     info   : dict        'K', 'evals' (zeros), 'var_ratio', 'cumvar'
     """
+    mu = R.mean(axis=0)
+    tau = np.maximum(-R, 0.0)   # non-negative optical depth
+
+    _, H, info = _nmf_core(tau, K, max_iter=max_iter, tol=tol, random_state=random_state)
+
+    norms = np.linalg.norm(H, axis=1)
+    norms[norms == 0] = 1.0
+    Phi = -(H / norms[:, None])  # log-flux absorption templates, ≤ 0 in lines
+
+    return mu, Phi, info
+
+
+def _nmf_core(V, K, max_iter=500, tol=1e-4, random_state=0):
+    """Lee & Seung multiplicative-update NMF on a non-negative matrix V.
+
+    Returns ``(W, H, info)`` raw (not normalised). Shared by
+    :func:`build_nmf` and :func:`build_nmf_linear`.
+    """
     eps = 1e-10
     rng = np.random.default_rng(random_state)
-
-    mu = R.mean(axis=0)
-    tau = np.maximum(-R, 0.0)   # non-negative optical depth, (n_spec, n_pix)
-    n_spec, n_pix = tau.shape
+    n_spec, n_pix = V.shape
     K = max(1, min(K, n_spec, n_pix))
 
-    # NNDSVD initialisation (Boutsidis & Gallopoulos 2008)
+    # NNDSVD initialisation
     try:
         from scipy.sparse.linalg import svds
         k_svd = min(K, min(n_spec, n_pix) - 1)
         v0 = rng.standard_normal(min(n_spec, n_pix))
-        U, S, Vt = svds(tau, k=k_svd, v0=v0)
-        # svds returns ascending order; flip to descending
+        U, S, Vt = svds(V, k=k_svd, v0=v0)
         U, S, Vt = U[:, ::-1], S[::-1], Vt[::-1, :]
         W = np.empty((n_spec, K))
         H = np.empty((K, n_pix))
@@ -205,37 +219,88 @@ def build_nmf(R, K, max_iter=500, tol=1e-4, random_state=0):
         W = rng.uniform(0.0, 1.0, (n_spec, K))
         H = rng.uniform(0.0, 1.0, (K, n_pix))
 
-    # Lee & Seung multiplicative updates
     prev_loss = np.inf
     for it in range(max_iter):
         WH = W @ H
-        H *= (W.T @ tau) / (W.T @ WH + eps)
+        H *= (W.T @ V) / (W.T @ WH + eps)
         np.maximum(H, eps, out=H)
         WH = W @ H
-        W *= (tau @ H.T) / (WH @ H.T + eps)
+        W *= (V @ H.T) / (WH @ H.T + eps)
         np.maximum(W, eps, out=W)
         if (it + 1) % 10 == 0:
-            loss = np.linalg.norm(tau - W @ H, "fro") ** 2
+            loss = np.linalg.norm(V - W @ H, "fro") ** 2
             converged = prev_loss < np.inf and abs(prev_loss - loss) / (prev_loss + eps) < tol
             prev_loss = loss
             if converged:
                 print(f"  NMF converged at iteration {it + 1}, loss={loss:.4e}")
                 break
 
-    # Normalise H rows to unit norm (mirrors PCA convention)
-    norms = np.linalg.norm(H, axis=1)
-    norms[norms == 0] = 1.0
-    Phi = -(H / norms[:, None])  # log-flux absorption templates, ≤ 0 in lines
-
-    # Variance metrics: total fraction of τ² explained, split evenly
-    total_var = float(np.sum(tau ** 2))
-    recon_err = float(np.linalg.norm(tau - W @ H, "fro") ** 2)
+    total_var = float(np.sum(V ** 2))
+    recon_err = float(np.linalg.norm(V - W @ H, "fro") ** 2)
     frac = max(0.0, 1.0 - recon_err / (total_var + eps))
     var_ratio = np.full(K, frac / K)
     cumvar = np.cumsum(var_ratio)
-
     info = {"K": K, "evals": np.zeros(K), "var_ratio": var_ratio, "cumvar": cumvar}
+    return W, H, info
+
+
+def rectify_linear(loglam, flux, order=5, **clip_kw):
+    """Continuum-normalised LINEAR flux ``exp(R)`` for the linear-flux NMF basis.
+
+    :func:`rectify_grid` returns the log-rectified ``R = ln(flux) - cont`` (≤ 0
+    in lines, ≈ 0 in the continuum); ``exp(R) = flux / continuum`` is therefore
+    the strictly-positive *linearly* continuum-normalised flux (≈ 1 in the
+    continuum, dipping toward 0 in absorption lines). Feeding this to NMF makes
+    every template flat (≈ 1) outside lines, so the shift-dependent (velocity)
+    signal lives in the sharp line dips rather than in the continuum SHAPE --
+    which is what makes the cross-correlation RV well-determined. Operating on
+    raw (un-rectified) flux instead bakes each grid spectrum's full continuum
+    slope into ``mu``, which is collinear with the fitter's additive continuum
+    and drowns the line signal in a DC-dominated chi2.
+    """
+    R, _ = rectify_grid(loglam, flux, order=order, **clip_kw)
+    return np.exp(R)
+
+
+def build_nmf_linear(flux, K, max_iter=500, tol=1e-4, random_state=0):
+    """NMF of linear-flux spectra (no optical-depth transformation).
+
+    Operates directly on the positive linear-flux matrix ``flux``. The intended
+    input is the continuum-normalised flux from :func:`rectify_linear` (≈ 1 in
+    the continuum, dipping in lines); each spectrum is additionally normalised to
+    unit-median so NMF captures spectral *shape* rather than overall flux scale.
+
+    The components ``Phi`` are positive (not negated): they are linear-flux
+    spectral templates to be used in an additive linear-flux model
+    ``d ≈ A @ theta`` where ``A = [mu, Phi_0, ..., Phi_{K-1}]``.
+
+    Returns
+    -------
+    mu   : (n_pix,)   mean normalised spectrum (the reference template)
+    Phi  : (K, n_pix) unit-norm NMF components (all ≥ 0)
+    info : dict       'K', 'evals', 'var_ratio', 'cumvar'
+    """
+    # Normalise each spectrum to unit-median so NMF captures shape.
+    meds = np.median(flux, axis=1, keepdims=True)
+    meds = np.where(meds > 0, meds, 1.0)
+    V = flux / meds                # (n_spec, n_pix), positive, ~unit scale
+    mu = V.mean(axis=0)
+
+    W, H, info = _nmf_core(V, K, max_iter=max_iter, tol=tol, random_state=random_state)
+
+    # Unit-norm columns (positive; no negation -- these are flux templates)
+    norms = np.linalg.norm(H, axis=1)
+    norms[norms == 0] = 1.0
+    Phi = H / norms[:, None]
     return mu, Phi, info
+
+
+def build_telluric_nmf_linear(loglam, flux, K, order=5, **kw):
+    """Thin wrapper: continuum-normalise (:func:`rectify_linear`) then NMF.
+
+    Pass ``frame="observed"`` and ``params=None`` to :func:`save_basis`.
+    """
+    return build_nmf_linear(rectify_linear(loglam, flux, order=order), K, **kw)
 
 
 def build_telluric_nmf(loglam, flux, K, order=5, **kw):

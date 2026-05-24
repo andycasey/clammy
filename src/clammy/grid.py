@@ -196,7 +196,22 @@ def load_spectra(templ_dir=".", pattern="*.fits", wave_col="wave", flux_col="flu
 
     loglam = None
     fluxes = []
+    file_labels = []
     for path in files_full:
+        # An npz holding a 2-D flux matrix (the natural single-file format for a
+        # model grid like the PypeIt TellPCA reconstruction) is loaded via the
+        # matrix loader so the full (n_spec, n_pix) block is ingested at once.
+        if str(path).endswith(".npz"):
+            w, fl_mat, lbls = _load_spectra_matrix(path, wave_col, flux_col)
+            if loglam is None:
+                loglam = w
+            elif w.shape != loglam.shape or not np.allclose(w, loglam, atol=0, rtol=1e-12):
+                raise ValueError(f"{path} is not on the shared log-lambda grid")
+            for row, lbl in zip(fl_mat, lbls):
+                fluxes.append(row)
+                file_labels.append(lbl)
+            continue
+
         w, fl = _load_one_spectrum(path, wave_col, flux_col)
         if loglam is None:
             loglam = w
@@ -208,7 +223,7 @@ def load_spectra(templ_dir=".", pattern="*.fits", wave_col="wave", flux_col="flu
                 "log-rectification step (got non-positive or non-finite values)"
             )
         fluxes.append(fl)
+        file_labels.append(os.path.basename(path))
 
     flux = np.asarray(fluxes)
-    files = [os.path.basename(p) for p in files_full]
-    return loglam, flux, files
+    return loglam, flux, file_labels
