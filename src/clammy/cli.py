@@ -120,6 +120,15 @@ def _column(table, name):
     return np.asarray(table[name], float)
 
 
+def _parse_hdu(val):
+    """--hdu as an int extension index (e.g. '42', matching hdu[42]) or an EXTNAME
+    string (e.g. 'SPAT0248-SLIT0177-MSC03'); None (no --hdu) passes through."""
+    if val is None:
+        return None
+    s = str(val)
+    return int(s) if s.lstrip("+-").isdigit() else s
+
+
 def vac_to_air(wave_vac):
     """Vacuum -> air wavelengths (Angstrom), matching the dmost/PHOENIX template grid."""
     w = np.asarray(wave_vac, float)
@@ -129,36 +138,103 @@ def vac_to_air(wave_vac):
 
 
 def read_spectrum(path, wave_col, flux_col, sigma_col, ivar_col, mask_col, snr,
-                  log_wave, wave_frame):
-    """Return (loglam, flux, sigma, good) for an observed spectrum.
+                  log_wave, wave_frame, hdu=None, max_spike=30.0):
+    """Return (loglam, flux, sigma, good, ext_label) for an observed spectrum.
 
-    Supports .npz (arrays keyed by name) and FITS tables (incl. the dmost single-row
-    array-cell layout and PypeIt ``OneSpec`` per-pixel tables). Uncertainties come
-    from ``sigma_col`` if present, else ``ivar_col`` (``sigma = 1/sqrt(ivar)``), else
-    ``--snr``. A 1=good ``mask_col`` is honoured (returned as ``good``; else None).
-    The wavelength axis is linear-A or natural-log (auto-detected: median > 50 ->
-    linear), and is converted vacuum->air to match the (air) template grid when
-    ``wave_frame='vacuum'`` -- or ``'auto'`` and the file looks like a PypeIt product
-    (e.g. a Keck/DEIMOS OneSpec spectrum, which stores vacuum wavelengths).
+    ``ext_label`` is the slit/extension name (e.g. ``SPAT0248-SLIT0177-MSC03``)
+    when the file is a multi-extension spec1d -- used to label the fit log, plot
+    title, and auto-named PNGs so per-slit runs don't overwrite each other -- and
+    ``None`` for .npz or a single-spectrum FITS (output naming then unchanged).
+
+    Supports .npz (arrays keyed by name) and FITS tables: the dmost single-row
+    array-cell layout, PypeIt ``OneSpec`` per-pixel tables, and PypeIt ``spec1d``
+    multi-extension files (one ``SpecObj`` table per slit/object). For ``spec1d``,
+    pass ``hdu`` (an integer extension index matching ``hdu[N]`` -- e.g. 42 -- or an
+    ``EXTNAME`` string like ``SPAT0248-SLIT0177-MSC03``) to choose the slit, and the
+    optimal-extraction columns (``OPT_WAVE``/``OPT_COUNTS``/``OPT_COUNTS_IVAR``/
+    ``OPT_MASK``) are picked up automatically when the generic defaults are absent.
+
+    Uncertainties come from ``sigma_col`` if present, else ``ivar_col``
+    (``sigma = 1/sqrt(ivar)``), else ``--snr``; non-positive sigma (masked pixels)
+    is set to ``inf`` so it carries no weight. A 1=good ``mask_col`` is honoured
+    (returned as ``good``; else None). ``max_spike>0`` additionally rejects
+    catastrophic positive flux spikes (cosmic rays / hot pixels the pipeline mask
+    missed) more than ``max_spike`` times a robust running continuum -- raw PypeIt
+    counts carry a handful, and in the weighted log-flux fit they would otherwise
+    dominate everything (and overflow ``exp``); the cut is conservative enough never
+    to trip on clean / continuum-normalized data. The wavelength axis is linear-A or natural-log
+    (auto-detected: median > 50 -> linear), and is converted vacuum->air to match the
+    (air) template grid when ``wave_frame='vacuum'`` -- or ``'auto'`` and the file
+    looks like a PypeIt product (e.g. a Keck/DEIMOS spectrum, which stores vacuum
+    wavelengths).
     """
-    meta = {}
+    meta, ext_label = {}, None
     if path.endswith(".npz"):
         d = np.load(path)
         present = set(d.files)
         col = lambda c: np.asarray(d[c], float)
     else:
+        from astropy.io import fits
         from astropy.table import Table
 
-        t = Table.read(path)
-        meta = {str(k).upper(): t.meta[k] for k in t.meta}
+        t = Table.read(path, hdu=hdu) if hdu is not None else Table.read(path)
+        # Identify which extension was actually read. spec1d files hold one slit
+        # per HDU, and without this nothing downstream (log, plot title, PNG name)
+        # records which slit was fit -- and a default/auto run silently takes
+        # hdu=1. Also merge the PRIMARY header so the vacuum/air auto-detection
+        # keys (PYP_SPEC/INSTRUME/DMODCLS) are visible; they live in HDU 0, not
+        # the slit table.
+        ext_name = str(t.meta.get("EXTNAME", "")).strip()
+        try:
+            with fits.open(path) as hdul:
+                ph = hdul[0].header
+                meta = {str(k).upper(): ph[k] for k in ph if k}
+                multi_ext = sum(isinstance(h, fits.BinTableHDU) for h in hdul) > 1
+                if isinstance(hdu, str):
+                    ext_idx = hdul.index_of(hdu)
+                elif isinstance(hdu, (int, np.integer)):
+                    ext_idx = int(hdu)
+                elif ext_name:
+                    ext_idx = hdul.index_of(ext_name)
+                else:
+                    ext_idx = None
+                if not ext_name and ext_idx is not None:
+                    ext_name = str(hdul[ext_idx].name).strip()
+        except Exception:
+            meta, multi_ext = {}, False
+            ext_idx = hdu if isinstance(hdu, int) else None
+        meta.update({str(k).upper(): t.meta[k] for k in t.meta})
         present = set(t.colnames)
         col = lambda c: _column(t, c)
+
+        # Only label genuine multi-extension (spec1d) files, so single-spectrum
+        # FITS keep their plain "<spectrum>-fit.png" output names.
+        if multi_ext:
+            ext_label = ext_name or (f"hdu{ext_idx}" if ext_idx is not None else None)
+            if ext_label:
+                where = f"hdu={ext_idx}" if ext_idx is not None else f"hdu={hdu!r}"
+                print(f"read extension {ext_label!r} ({where})")
+
+        # PypeIt spec1d (SpecObj) tables name their columns OPT_*/BOX_*; fall back to
+        # the optimal-extraction columns whenever a generic default name is absent.
+        _alt = lambda name, opt: name if name in present else (opt if opt in present else name)
+        wave_col, flux_col, sigma_col, ivar_col, mask_col = (
+            _alt(wave_col, "OPT_WAVE"),
+            _alt(flux_col, "OPT_COUNTS"),
+            _alt(sigma_col, "OPT_COUNTS_SIG"),
+            _alt(ivar_col, "OPT_COUNTS_IVAR"),
+            _alt(mask_col, "OPT_MASK"),
+        )
+        if wave_col.startswith("OPT_") or flux_col.startswith("OPT_"):
+            print(f"PypeIt spec1d columns detected: using "
+                  f"{wave_col}/{flux_col}/{ivar_col}/{mask_col}")
 
     wave = col(wave_col)
     flux = col(flux_col)
 
     if sigma_col in present:
-        sigma = col(sigma_col)
+        s = col(sigma_col)
+        sigma = np.where(s > 0, s, np.inf)  # masked pixels carry sigma=0 -> ignore
     elif ivar_col in present:
         iv = col(ivar_col)
         sigma = np.where(iv > 0, 1.0 / np.sqrt(np.where(iv > 0, iv, 1.0)), np.inf)
@@ -170,6 +246,19 @@ def read_spectrum(path, wave_col, flux_col, sigma_col, ivar_col, mask_col, snr,
         )
 
     good = (np.asarray(col(mask_col), float) > 0) if mask_col in present else None
+
+    if max_spike and max_spike > 0:
+        from scipy.ndimage import median_filter
+
+        f = np.asarray(flux, float)
+        cont = median_filter(np.nan_to_num(f, nan=0.0), size=51)  # robust to isolated CRs
+        spike = np.isfinite(f) & (cont > 0) & (f > max_spike * cont)
+        if spike.any():
+            good = (np.ones(f.shape, bool) if good is None else good) & ~spike
+            print(
+                f"rejected {int(spike.sum())} catastrophic flux spike(s) "
+                f"(> {max_spike:g}x local continuum; cosmic rays / hot pixels)"
+            )
 
     if log_wave is None:
         log_wave = np.nanmedian(wave) < 50.0  # log axis is ~8-9; linear is thousands
@@ -185,7 +274,7 @@ def read_spectrum(path, wave_col, flux_col, sigma_col, ivar_col, mask_col, snr,
         wave_ang = vac_to_air(wave_ang)
         print("converted observed wavelengths vacuum -> air (matching the air template grid)")
 
-    return np.log(wave_ang), flux, sigma, good
+    return np.log(wave_ang), flux, sigma, good, ext_label
 
 
 def _auto_vbary(path):
@@ -329,7 +418,7 @@ def cmd_fit(args):
 def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_tell, ref,
              nnls_stellar=False, nnls_telluric=False):
     """Fit one spectrum and write its report, JSON, and plots."""
-    loglam_o, flux_o, sigma_o, good_o = read_spectrum(
+    loglam_o, flux_o, sigma_o, good_o, ext_label = read_spectrum(
         path,
         args.wave_col,
         args.flux_col,
@@ -339,6 +428,8 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         args.snr,
         args.log_wave,
         args.wave_frame,
+        hdu=_parse_hdu(args.hdu),
+        max_spike=args.max_spike,
     )
 
     # resample onto the basis grid if the observation is on a different grid
@@ -357,6 +448,20 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         print(
             f"resampled observation onto basis grid "
             f"({int(np.asarray(mask).sum())} of {loglam_b.size} px usable)"
+        )
+
+    # restrict the fit -- and, via the `good` mask the fitter returns, the plotted
+    # range -- to the [wl_min, wl_max] observed-wavelength window. Out-of-window
+    # pixels are masked (zero weight), so they enter neither chi2 nor the plot.
+    if args.wl_min is not None or args.wl_max is not None:
+        lam_b = np.exp(np.asarray(loglam_b, float))
+        lo = -np.inf if args.wl_min is None else float(args.wl_min)
+        hi = np.inf if args.wl_max is None else float(args.wl_max)
+        window = (lam_b >= lo) & (lam_b <= hi)
+        mask = window if mask is None else (np.asarray(mask, bool) & window)
+        print(
+            f"restricted to {lo:g}-{hi:g} A "
+            f"({int(window.sum())} of {lam_b.size} basis px in window)"
         )
 
     fit_kwargs = dict(
@@ -431,6 +536,8 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
             k: res[k]
             for k in ("v_kms", "v_err_kms", "chi2", "dof", "chi2_dof", "n_good")
         }
+        if ext_label:
+            payload["extension"] = ext_label
         payload["w"] = res["w"].tolist()
         payload["c"] = res["c"].tolist()
         if args.fit_resolution:
@@ -467,16 +574,19 @@ def _fit_one(path, args, loglam_b, mu, Phi, R_native_star, tell_basis, R_native_
         print(f"wrote results -> {args.out}")
 
     # output plots: explicit --plot/--scan-plot, or auto-named "<spectrum>-{fit,scan}.png"
-    # next to each input when --plots is given.
-    stem = os.path.splitext(path)[0]
+    # next to each input when --plots is given. For multi-slit spec1d files the slit
+    # label is folded into the auto-name (so per-slit runs don't overwrite) and the
+    # plot title (so the figure says which slit it is); explicit names are untouched.
+    stem = os.path.splitext(path)[0] + (f"-{ext_label}" if ext_label else "")
+    source = os.path.basename(path) + (f" [{ext_label}]" if ext_label else "")
     fit_png = args.plot or (f"{stem}-fit.png" if args.plots else None)
     scan_png = args.scan_plot or (f"{stem}-scan.png" if args.plots else None)
     if fit_png:
         _plot_fit(loglam_b, flux, sigma, res, fit_png,
-                  source=os.path.basename(path), ref=ref, vbary=vbary)
+                  source=source, ref=ref, vbary=vbary)
         print(f"wrote plot -> {fit_png}")
     if scan_png:
-        _plot_scan(res, scan_png, source=os.path.basename(path))
+        _plot_scan(res, scan_png, source=source)
         print(f"wrote scan plot -> {scan_png}")
 
 
@@ -496,21 +606,23 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
         gridspec_kw={"height_ratios": [3, 1]},
     )
     ax[0].plot(lam[sl], flux[sl], lw=0.4, color="black", label="data")
-    # decompose the (multiplicative) model: continuum, and the stellar / telluric
-    # absorption each applied ON the continuum. ln_cont/ln_star/ln_tell come from the
-    # fitter; fall back to recomputing the continuum from c if absent.
+    # decompose the (multiplicative) model: continuum and the telluric absorption
+    # applied ON the continuum. ln_cont/ln_tell come from the fitter; fall back to
+    # recomputing the continuum from c if absent.
     cont_ln = (np.asarray(res["ln_cont"]) if "ln_cont" in res
                else np.polynomial.legendre.legval(basis.xnorm(loglam), res["c"]))
+    # the FULL model -- continuum × stellar × telluric -- is what the residual
+    # panel measures; always draw it so the top panel shows what is actually fit.
+    # The telluric × continuum overlay omits the stellar absorption, so it sits
+    # above the data where stellar lines are -- don't read it as the fit. Layering:
+    # data (black) and the full model (red) are the primary curves; the telluric ×
+    # continuum and continuum overlays are secondary and recede (thin, alpha).
+    ax[0].plot(lam[sl], res["model"][sl], lw=0.9, color="tab:red", label="model")
     if "ln_tell" in res:
         ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_tell"]) + cont_ln)[sl],
-                   lw=0.6, color="tab:blue", label="telluric × continuum")
-    if "ln_star" in res:
-        ax[0].plot(lam[sl], np.exp(np.asarray(res["ln_star"]) + cont_ln)[sl],
-                   lw=0.6, color="tab:red", label="stellar × continuum")
-    else:
-        ax[0].plot(lam[sl], res["model"][sl], lw=0.6, color="tab:red", label="model")
-    ax[0].plot(lam[sl], np.exp(cont_ln)[sl], lw=1.0, color="tab:orange", ls="--",
-               label="continuum")
+                   lw=0.5, alpha=0.5, color="tab:blue", label="telluric × continuum")
+    ax[0].plot(lam[sl], np.exp(cont_ln)[sl], lw=0.8, alpha=0.7, color="tab:orange",
+               ls="--", label="continuum")
     # restrict both panels to where there is real (in-coverage, finite) data; the
     # resampled data is edge-clamped (finite) outside coverage, so use the `good` mask.
     valid = np.isfinite(flux)
@@ -569,11 +681,11 @@ def _plot_fit(loglam, flux, sigma, res, path, source=None, ref=None, vbary=None)
 def _plot_scan(res, path, source=None):
     """Profiled Delta-chi2 vs each fitted nonlinear parameter.
 
-    chi2(v) is the coarse FFT scan (its velocity minimum is exact); chi2(R) and
-    chi2(vsini) are recomputed EXACTLY at the optimum (``R_curve``/``vsini_curve``
-    from the fitter), so their minima coincide with the reported values -- unlike
-    the coarse (M_TT(0)-approximation) surface, whose R-minimum is biased at large
-    RV shifts.
+    chi2(v), chi2(R) and chi2(vsini) are each recomputed EXACTLY at the optimum
+    (``v_curve``/``R_curve``/``vsini_curve`` from the fitter), so their minima
+    coincide with the reported values. The coarse (M_TT(0)-approximation) surface
+    is only a fallback for ``v`` when ``v_curve`` is absent -- it can be biased (even
+    negative) at large lags, so its minimum is not necessarily a real chi2 minimum.
     """
     import matplotlib
 
@@ -582,10 +694,16 @@ def _plot_scan(res, path, source=None):
 
     # (x, Delta-chi2, x_opt, xlabel, ylabel, log-x?)
     panels = []
-    v = np.asarray(res["v_grid"], float)
-    cv = np.asarray(res["chi2_grid"], float)
-    panels.append((v, cv - np.nanmin(cv), res["v_kms"], "v [km/s]",
-                   r"$\Delta\chi^2$ (coarse)", False))
+    if "v_curve" in res:
+        v, cv = res["v_curve"]
+        v = np.asarray(v, float); cv = np.asarray(cv, float)
+        panels.append((v, cv - np.nanmin(cv), res["v_kms"], "v [km/s]",
+                       r"$\Delta\chi^2$ (exact)", False))
+    else:
+        v = np.asarray(res["v_grid"], float)
+        cv = np.asarray(res["chi2_grid"], float)
+        panels.append((v, cv - np.nanmin(cv), res["v_kms"], "v [km/s]",
+                       r"$\Delta\chi^2$ (coarse)", False))
     if "R_curve" in res:
         Rg, cR = res["R_curve"]
         panels.append((np.asarray(Rg, float), np.asarray(cR, float) - np.nanmin(cR),
@@ -717,6 +835,11 @@ def build_parser():
         "wavelength zero-point); reports v_tell and the zero-point-corrected v_corr",
     )
     pf.add_argument("--cont-order", type=int, default=3, help="Legendre continuum order")
+    pf.add_argument("--wl-min", dest="wl_min", type=float, default=6775.0,
+                    help="only fit/plot observed wavelengths >= this [A] (default 6775); "
+                    "out-of-window pixels are masked from the fit and the plot")
+    pf.add_argument("--wl-max", dest="wl_max", type=float, default=8700.0,
+                    help="only fit/plot observed wavelengths <= this [A] (default 8700)")
     pf.add_argument("--vmin", type=float, default=-500.0, help="RV search min [km/s]")
     pf.add_argument("--vmax", type=float, default=500.0, help="RV search max [km/s]")
     pf.add_argument(
@@ -769,6 +892,23 @@ def build_parser():
         "(default 0.6)",
     )
     pf.add_argument("--ridge", type=float, default=0.0, help="Tikhonov ridge on the normal matrix")
+    pf.add_argument(
+        "--hdu",
+        default=None,
+        help="FITS extension to read from a multi-extension file (e.g. a PypeIt "
+        "spec1d): an integer index matching hdu[N] (e.g. 42) or an EXTNAME string "
+        "like SPAT0248-SLIT0177-MSC03. Default: the first table HDU. The PypeIt "
+        "OPT_WAVE/OPT_COUNTS/OPT_COUNTS_IVAR/OPT_MASK columns are then auto-detected",
+    )
+    pf.add_argument(
+        "--max-spike",
+        type=float,
+        default=30.0,
+        metavar="FACTOR",
+        help="reject positive flux spikes (unmasked cosmic rays / hot pixels) more "
+        "than FACTOR x a robust running continuum; needed so raw PypeIt counts don't "
+        "blow up the log-flux fit. Conservative (never trips on clean data); 0=off",
+    )
     pf.add_argument("--wave-col", default="wave")
     pf.add_argument("--flux-col", default="flux")
     pf.add_argument("--sigma-col", default="sigma")

@@ -211,12 +211,42 @@ clammy fit outputs/basis.npz spectrum.fits --fit-resolution \
 
 # add an observed-frame telluric block (NOT RV-shifted); fit vsini too
 clammy fit outputs/basis.npz spectrum.fits --telluric-basis outputs/tell.npz --fit-vsini
+
+# raw PypeIt spec1d (multi-extension; one slit/object per HDU). Pick the slit with
+# --hdu N (matching hdu[N], e.g. 42) or an EXTNAME string; OPT_WAVE/OPT_COUNTS/
+# OPT_COUNTS_IVAR/OPT_MASK are auto-detected and the (vacuum) wavelengths -> air.
+clammy fit outputs/basis.npz spec1d_DE.*.fits --hdu 42 \
+           --telluric-basis outputs/tell.npz --fit-resolution --fit-telluric-shift
 ```
 
 `fit` reads `wave`/`flux`/`sigma` columns (override with `--wave-col` etc.; use
 `--snr` if there is no uncertainty column), resamples onto the basis grid if
 needed, and prints `v[, R][, vsini]`, χ²/dof, stellar weights, telluric weights
 (when a `--telluric-basis` is given), and continuum coefficients.
+
+By default the fit (and the plot) is restricted to the observed-wavelength window
+`--wl-min 6775 --wl-max 8700` Å — the clean stellar region around the Ca II
+triplet, dropping the noisy blue/red ends that otherwise bias the RV. Widen with
+`--wl-min 0 --wl-max 1e9` for the full range; out-of-window pixels are masked
+(they enter neither χ² nor the plot). Very narrow windows under-constrain the
+linear blocks (continuum + tellurics) and can return a degenerate fit.
+
+**PypeIt `spec1d` files.** These hold one `SpecObj` table per slit/object across
+many extensions, so pass `--hdu` to choose one — an integer index matching
+`hdu[N]` (the dmost slit number) or an `EXTNAME` like `SPAT0248-SLIT0177-MSC03`.
+The chosen slit is echoed to the log (`read extension '…' (hdu=N)` — including the
+`hdu=1` a default run silently takes) and, for these multi-slit files, folded into
+the plot title and the auto-named `<spectrum>-<EXTNAME>-{fit,scan}.png` so per-slit
+runs don't overwrite one another. The optimal-extraction columns (`OPT_WAVE`/
+`OPT_COUNTS`/`OPT_COUNTS_IVAR`/`OPT_MASK`) and the vacuum wavelength frame are
+detected automatically. Raw
+counts carry a few unmasked cosmic-ray/hot-pixel spikes that would otherwise
+dominate the log-flux fit; `--max-spike FACTOR` (default 30, `0` disables)
+rejects pixels above `FACTOR ×` a robust running continuum. Note these raw
+spectra have **not** had the dmost flexure correction applied — `clammy` fits the
+linear wavelength zero-point itself via `--fit-telluric-shift` (reported as
+`v_tell`; the corrected RV is `v_corr`), but a large per-exposure flexure is best
+removed beforehand.
 
 **The four broadening modes** (instrument resolution `R` and rotation `vsini`):
 

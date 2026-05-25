@@ -100,9 +100,21 @@ from . import C_LIGHT_KMS, sigma_kms_of_R, R_of_sigma_kms
 from .basis import xnorm
 
 
-def _legendre_design(loglam, order):
-    """(n_pix, order+1) Legendre design matrix over the log-lambda range."""
-    return npleg.legvander(xnorm(loglam), order)
+def _legendre_design(loglam, order, rng=None):
+    """(n_pix, order+1) Legendre design matrix over the log-lambda range.
+
+    ``rng=(a, b)`` normalizes the abscissa to [-1, 1] over [a, b] (e.g. the fitted
+    good-pixel window) rather than the full grid endpoints, clipping out-of-range
+    pixels to +-1 so high orders stay bounded. This keeps the continuum normal
+    matrix well-conditioned when the fit covers only a sub-interval of the grid --
+    anchoring to the grid endpoints leaves a masked sub-window's high orders
+    collinear (cond ~ 1e15 at order 15; windowing keeps it ~30).
+    """
+    if rng is None:
+        return npleg.legvander(xnorm(loglam), order)
+    a, b = float(rng[0]), float(rng[1])
+    x = np.clip(2.0 * (np.asarray(loglam, float) - a) / (b - a) - 1.0, -1.0, 1.0)
+    return npleg.legvander(x, order)
 
 
 def _g_rot(freq, vsini_pix, epsilon, j):
@@ -521,7 +533,11 @@ def fit_rv(
     # --- design blocks ----------------------------------------------------------
     T = np.vstack([mu, Phi]).T
     Ktot = T.shape[1]
-    P = _legendre_design(loglam, cont_order)
+    # Normalize the continuum abscissa to the FITTED (good-pixel) window so the
+    # Legendre columns span [-1, 1] over exactly the data being fit; otherwise a
+    # masked sub-window leaves high orders collinear and the solve blows up.
+    _gl = loglam[good] if np.any(good) else loglam
+    P = _legendre_design(loglam, cont_order, rng=(_gl.min(), _gl.max()))
     L1 = P.shape[1]
 
     # telluric block S = [tell_mu, tell_Phi]^T (observed frame). NOT shifted unless
@@ -721,7 +737,11 @@ def fit_rv(
         # ``lnd_arg``/``const_arg`` default to the raw data; the linear-flux
         # convolution loop passes the corrected ``lnd_eff`` (and its const) here so
         # the Newton refine fits the corrected data (a warm restart from x0).
-        lo, hi = [-np.inf], [np.inf]
+        # The RV lag is bounded to the [p_lo, p_hi] search window (= [vmin, vmax]);
+        # without this the unconstrained Newton step can slide out of the window
+        # entirely (and away from the coarse seed) on ill-conditioned/multi-modal
+        # objectives, returning an RV the scan never searched.
+        lo, hi = [float(p_lo)], [float(p_hi)]
         if fit_R:
             lo.append(float(sigpix_of_R(R_bounds[1])))
             hi.append(float(sigpix_of_R(R_bounds[0])))
@@ -778,6 +798,21 @@ def fit_rv(
 
     _, i_sp, i_vs, j0 = best
 
+    # --- exact velocity seed ---------------------------------------------------
+    # The coarse cube uses the M_TT(0) zero-shift approximation: it is NOT a true
+    # chi2 (it can go negative), so its lag-minimum can be spurious and seed Newton
+    # in the wrong RV basin. Replace the coarse lag seed with the argmin of an EXACT
+    # chi2(v) scan at the coarse-best broadening (telluric at zero lag), sampled on
+    # <=161 lags across the [p_lo, p_hi] search window (one FFT + solve each). The
+    # same array is reused as the reported velocity marginal (out["v_curve"]), so
+    # this replaces -- not adds to -- the per-fit exact-scan cost.
+    n_v = int(min(p_hi - p_lo + 1, 161))
+    p_curve = np.linspace(float(p_lo), float(p_hi), max(n_v, 2))
+    vscan_chi2 = np.array([_exact_at(float(p), float(sp_vals[i_sp]),
+                                     float(vs_vals[i_vs]), 0.0)[0] for p in p_curve])
+    p_seed = float(p_curve[int(np.argmin(vscan_chi2))])
+    v_curve_arr = (C_LIGHT_KMS * np.expm1(p_curve * dln), vscan_chi2)
+
     # detect lower-limit (unresolved) situations at the coarse-grid minimum.
     if fit_resolution and i_sp == 0:
         resolution_limited = True
@@ -791,7 +826,7 @@ def fit_rv(
     refine_R = fit_resolution and not resolution_limited
     refine_vs = fit_vsini and not vsini_limited
 
-    x0 = [float(lags[j0])]
+    x0 = [p_seed]
     if refine_R:
         x0.append(float(sp_vals[i_sp]))
     if refine_vs:
@@ -998,6 +1033,12 @@ def fit_rv(
         out["vsini_curve"] = (vs_grid_fine, np.array([
             _exact_at(p_star, sp_star, float(vk / velscale), p_tell_star)[0]
             for vk in vs_grid_fine]))
+
+    # EXACT chi2(v) marginal: the seed-time velocity scan (exact, at the coarse-best
+    # broadening, telluric at zero lag) -- an honest chi2 curve, unlike the coarse
+    # M_TT(0) `chi2_grid`. Its argmin seeded Newton, so the reported v sits in its
+    # global trough (up to the small broadening/telluric refinement).
+    out["v_curve"] = v_curve_arr
 
     # --- build the (p, sigma_obs, vsini) -> (v, R, vsini) Jacobian + cov --------
     # column order of cov_x matches x_star = [p (, sigma_obs_pix) (, vsini_pix)].
